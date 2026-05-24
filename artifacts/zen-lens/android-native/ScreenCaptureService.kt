@@ -2,21 +2,41 @@ package com.zenlens.app
 
 import android.app.*
 import android.content.Intent
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
+
+private const val TAG = "ZenLensService"
 
 /**
  * ScreenCaptureService
  *
- * A foreground service required by Android to run screen capture in the background.
- * Android 10+ requires FOREGROUND_SERVICE_MEDIA_PROJECTION type.
+ * Foreground service required by Android for MediaProjection screen capture.
+ * This checkpoint implements safe startup and teardown of the projection session.
+ * Continuous frame capture (VirtualDisplay / ImageReader) is the next checkpoint.
+ *
+ * Startup sequence:
+ *   1. onCreate()        — create notification channel
+ *   2. onStartCommand()  — extract resultCode + resultData from Intent
+ *   3.                   — call startForeground() (must happen within 5s on API 26+)
+ *   4.                   — create MediaProjectionManager
+ *   5.                   — call getMediaProjection(resultCode, resultData)
+ *   6.                   — register MediaProjection.Callback
+ *   7.                   — set isRunning = true
+ *
+ * Teardown:
+ *   1. stopCaptureService() from JS calls context.stopService()
+ *   2. onDestroy() — stop + release MediaProjection, set isRunning = false
+ *
+ * Android 14+ note:
+ *   getMediaProjection() with the same resultData can only be called ONCE.
+ *   ScreenCaptureModule.stopCaptureService() clears pendingResultData after stopping,
+ *   enforcing that a fresh requestPermission() is required for each capture session.
  *
  * Declare in AndroidManifest.xml:
- *
- *   <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
- *   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
- *
  *   <service
  *     android:name=".ScreenCaptureService"
  *     android:foregroundServiceType="mediaProjection"
@@ -27,47 +47,77 @@ class ScreenCaptureService : Service() {
     companion object {
         const val CHANNEL_ID = "zenlens_capture_channel"
         const val NOTIFICATION_ID = 42
+
+        /**
+         * Thread-safe running flag. Read by ScreenCaptureModule.getCaptureServiceStatus().
+         * Set true after startForeground() succeeds. Set false in onDestroy().
+         */
+        @Volatile var isRunning = false
     }
+
+    private var mediaProjection: MediaProjection? = null
+    private var projectionManager: MediaProjectionManager? = null
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
+        Log.d(TAG, "onCreate: service created")
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val cropX = intent?.getIntExtra("cropX", 0) ?: 0
-        val cropY = intent?.getIntExtra("cropY", 0) ?: 0
-        val cropW = intent?.getIntExtra("cropWidth", 0) ?: 0
-        val cropH = intent?.getIntExtra("cropHeight", 0) ?: 0
+        Log.d(TAG, "onStartCommand: received")
 
-        val stopIntent = Intent(this, ScreenCaptureService::class.java).apply {
-            action = "STOP"
+        // ── Handle STOP action (from notification "Stop" button) ──────────────
+        if (intent?.action == "STOP") {
+            Log.d(TAG, "onStartCommand: STOP action received — stopping self")
+            stopSelf()
+            return START_NOT_STICKY
         }
+
+        // ── Extract MediaProjection grant from Intent extras ───────────────────
+        val resultCode = intent?.getIntExtra("resultCode", Activity.RESULT_CANCELED)
+            ?: Activity.RESULT_CANCELED
+
+        val resultData: Intent? = if (Build.VERSION.SDK_INT >= 33) {
+            intent?.getParcelableExtra("resultData", Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent?.getParcelableExtra("resultData")
+        }
+
+        Log.d(TAG, "onStartCommand: resultCode=$resultCode, hasResultData=${resultData != null}")
+
+        if (resultCode != Activity.RESULT_OK || resultData == null) {
+            Log.e(TAG, "onStartCommand: invalid grant extras — stopping service")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        // ── Build persistent notification ─────────────────────────────────────
         val stopPendingIntent = PendingIntent.getService(
-            this, 0, stopIntent,
+            this, 0,
+            Intent(this, ScreenCaptureService::class.java).apply { action = "STOP" },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-
-        val openIntent = packageManager.getLaunchIntentForPackage(packageName)
         val openPendingIntent = PendingIntent.getActivity(
-            this, 0, openIntent,
+            this, 0,
+            packageManager.getLaunchIntentForPackage(packageName),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("ZenLens — Capturing")
-            .setContentText("Crop: ${cropW}×${cropH} at (${cropX}, ${cropY})")
+            .setContentTitle("ZenLens — Screen Capture Active")
+            .setContentText("Tap to return to ZenLens. Tap Stop to end capture.")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
             .setContentIntent(openPendingIntent)
-            .addAction(
-                android.R.drawable.ic_media_pause,
-                "Stop",
-                stopPendingIntent
-            )
+            .addAction(android.R.drawable.ic_media_pause, "Stop", stopPendingIntent)
             .build()
 
+        // ── startForeground() — MUST happen within 5s of service start ─────────
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
@@ -77,11 +127,41 @@ class ScreenCaptureService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
+        Log.d(TAG, "onStartCommand: startForeground() called")
 
-        if (intent?.action == "STOP") {
-            stopForeground(true)
+        // ── Create MediaProjection ─────────────────────────────────────────────
+        projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+
+        try {
+            mediaProjection = projectionManager!!.getMediaProjection(resultCode, resultData)
+            Log.d(TAG, "onStartCommand: MediaProjection created — ${mediaProjection != null}")
+        } catch (e: Exception) {
+            Log.e(TAG, "onStartCommand: getMediaProjection() failed: ${e.message}")
             stopSelf()
+            return START_NOT_STICKY
         }
+
+        if (mediaProjection == null) {
+            Log.e(TAG, "onStartCommand: getMediaProjection() returned null — stopping")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        // ── Register MediaProjection.Callback ─────────────────────────────────
+        // Required to be notified when the system or user ends the projection
+        // (e.g. user taps "Stop sharing" in the Android status bar).
+        mediaProjection!!.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                Log.d(TAG, "MediaProjection.Callback.onStop: projection stopped by system")
+                isRunning = false
+                stopSelf()
+            }
+        }, null)
+
+        isRunning = true
+        Log.d(TAG, "onStartCommand: MediaProjection.Callback registered — service fully started, isRunning=true")
+
+        // Next checkpoint: set up VirtualDisplay + ImageReader here for frame capture.
 
         return START_NOT_STICKY
     }
@@ -89,9 +169,27 @@ class ScreenCaptureService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        super.onDestroy()
+        Log.d(TAG, "onDestroy: cleaning up")
+
+        try {
+            mediaProjection?.stop()
+            Log.d(TAG, "onDestroy: MediaProjection stopped")
+        } catch (e: Exception) {
+            Log.e(TAG, "onDestroy: error stopping MediaProjection: ${e.message}")
+        }
+        mediaProjection = null
+        projectionManager = null
+
+        @Suppress("DEPRECATION")
         stopForeground(true)
+
+        isRunning = false
+        Log.d(TAG, "onDestroy: service destroyed, isRunning=false")
+
+        super.onDestroy()
     }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -103,8 +201,9 @@ class ScreenCaptureService : Service() {
                 description = "Shown while ZenLens is capturing your screen"
                 setShowBadge(false)
             }
-            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-            nm.createNotificationChannel(channel)
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                .createNotificationChannel(channel)
+            Log.d(TAG, "createNotificationChannel: channel created")
         }
     }
 }

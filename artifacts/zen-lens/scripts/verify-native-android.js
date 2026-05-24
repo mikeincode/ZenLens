@@ -2,10 +2,19 @@
 /**
  * scripts/verify-native-android.js
  *
- * Verifies that after prebuild + native sync, the Android project contains
- * all modules, permissions, and wiring required for real MediaProjection capture.
+ * Verifies the full foreground service handoff path for ZenLens native Android.
  *
- * Fails loudly with exact instructions if anything is missing.
+ * Checks:
+ *   - android/ project structure
+ *   - All 5 Kotlin files present + key tokens
+ *   - ScreenCaptureModule: permission + service handoff methods
+ *   - ScreenCaptureModule: ActivityEventListener wiring
+ *   - ScreenCaptureService: MediaProjection lifecycle, isRunning flag, logging
+ *   - AndroidManifest.xml: all permissions + service declaration
+ *   - MainApplication.kt: ZenLensPackage registered
+ *   - MainActivity.kt: belt-and-suspenders onActivityResult patch
+ *   - android/app/build.gradle: ML Kit dependency
+ *   - utils/ocr.ts: all JS wrappers present
  *
  * Usage:
  *   node scripts/verify-native-android.js
@@ -28,6 +37,8 @@ const MAIN_APP_PATH = path.join(PACKAGE_DIR, "MainApplication.kt");
 const MAIN_ACTIVITY_PATH = path.join(PACKAGE_DIR, "MainActivity.kt");
 const BUILD_GRADLE_PATH = path.join(ANDROID_ROOT, "app", "build.gradle");
 const CAPTURE_MODULE_PATH = path.join(PACKAGE_DIR, "ScreenCaptureModule.kt");
+const CAPTURE_SERVICE_PATH = path.join(PACKAGE_DIR, "ScreenCaptureService.kt");
+const OCR_UTIL = path.join(ROOT, "utils", "ocr.ts");
 
 const PATCH_SENTINEL = "// ZENLENS_ACTIVITY_RESULT_PATCH";
 
@@ -36,381 +47,274 @@ let failed = 0;
 let warnings = 0;
 
 function check(label, ok, detail) {
-  if (ok) {
-    console.log(`  ✓ ${label}`);
-    passed++;
-  } else {
-    console.error(`  ✗ ${label}`);
-    if (detail) console.error(`    → ${detail}`);
-    failed++;
-  }
+  if (ok) { console.log(`  ✓ ${label}`); passed++; }
+  else { console.error(`  ✗ ${label}`); if (detail) console.error(`    → ${detail}`); failed++; }
 }
-
 function warn(label, detail) {
-  console.warn(`  ⚠  ${label}`);
-  if (detail) console.warn(`    → ${detail}`);
-  warnings++;
+  console.warn(`  ⚠  ${label}`); if (detail) console.warn(`    → ${detail}`); warnings++;
 }
+function section(title) { console.log(`\n── ${title}`); }
 
-function section(title) {
-  console.log(`\n── ${title}`);
-}
+console.log("ZenLens Native Android Verification — Foreground Service Handoff");
+console.log("=".repeat(68));
 
-console.log("ZenLens Native Android Verification");
-console.log("=".repeat(60));
-
-// ─── 1. android/ directory ────────────────────────────────────────────────────
+// ─── 1. Project structure ─────────────────────────────────────────────────────
 
 section("Project structure");
-
 const androidExists = fs.existsSync(ANDROID_ROOT);
-check(
-  "android/ directory exists",
-  androidExists,
-  !androidExists ? "Run: npm run android:prebuild" : null
-);
+check("android/ directory exists", androidExists,
+  !androidExists ? "Run: npm run android:prebuild" : null);
+if (!androidExists) { console.error("\n✗ Cannot continue without android/.\n"); process.exit(1); }
+check(`java/${PACKAGE_PATH}/ exists`, fs.existsSync(PACKAGE_DIR), PACKAGE_DIR);
 
-if (!androidExists) {
-  console.error(`\n✗ Cannot continue without android/ directory.\n`);
-  process.exit(1);
-}
+// ─── 2. Kotlin files ──────────────────────────────────────────────────────────
 
-check(
-  `android/app/src/main/java/${PACKAGE_PATH}/ exists`,
-  fs.existsSync(PACKAGE_DIR),
-  `Expected: ${PACKAGE_DIR}`
-);
-
-// ─── 2. Kotlin source files ───────────────────────────────────────────────────
-
-section("Native Kotlin modules (file presence + content tokens)");
+section("Native Kotlin files");
 
 const REQUIRED_KT = [
-  {
-    file: "ScreenCaptureModule.kt",
-    label: "ScreenCaptureModule (MediaProjection capture)",
-    mustContain: [
-      "MEDIA_PROJECTION_REQUEST",
-      "startCapture",
-      "onMediaProjectionResult",
-      "captureFrame",
-    ],
-  },
-  {
-    file: "ScreenCaptureService.kt",
-    label: "ScreenCaptureService (foreground service)",
-    mustContain: ["Service", "startForeground"],
-  },
-  {
-    file: "OverlayModule.kt",
-    label: "OverlayModule (SYSTEM_ALERT_WINDOW overlay)",
-    mustContain: ["SYSTEM_ALERT_WINDOW", "WindowManager"],
-  },
-  {
-    file: "MLKitOCRModule.kt",
-    label: "MLKitOCRModule (Google ML Kit OCR)",
-    mustContain: ["TextRecognition", "recognizeText"],
-  },
-  {
-    file: "ZenLensPackage.kt",
-    label: "ZenLensPackage (ReactPackage registration)",
-    mustContain: ["ReactPackage", "createNativeModules"],
-  },
+  { file: "ScreenCaptureModule.kt", label: "ScreenCaptureModule", mustContain: [
+    "MEDIA_PROJECTION_REQUEST",
+    "onMediaProjectionResult",
+    "ActivityEventListener",
+    "addActivityEventListener",
+    "resultHandled",
+    "startCaptureService",
+    "stopCaptureService",
+    "getCaptureServiceStatus",
+    "checkWiring",
+    "pendingResultCode",
+    "pendingResultData",
+  ]},
+  { file: "ScreenCaptureService.kt", label: "ScreenCaptureService", mustContain: [
+    "isRunning",
+    "@Volatile",
+    "startForeground",
+    "getMediaProjection",
+    "MediaProjection.Callback",
+    "createNotificationChannel",
+    "FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION",
+    "getIntExtra",
+    "getParcelableExtra",
+    "onDestroy",
+    "Log.d",
+  ]},
+  { file: "OverlayModule.kt", label: "OverlayModule", mustContain: ["SYSTEM_ALERT_WINDOW", "WindowManager"] },
+  { file: "MLKitOCRModule.kt", label: "MLKitOCRModule", mustContain: ["TextRecognition", "recognizeText"] },
+  { file: "ZenLensPackage.kt", label: "ZenLensPackage", mustContain: ["ReactPackage", "createNativeModules"] },
 ];
 
 for (const { file, label, mustContain } of REQUIRED_KT) {
-  const filePath = path.join(PACKAGE_DIR, file);
-  const exists = fs.existsSync(filePath);
-  check(
-    `${label}: ${file} present`,
-    exists,
-    exists ? null : `Run: npm run android:sync-native`
-  );
-
+  const p = path.join(PACKAGE_DIR, file);
+  const exists = fs.existsSync(p);
+  check(`${label}: ${file} present`, exists,
+    exists ? null : `Run: npm run android:sync-native`);
   if (exists && mustContain) {
-    const src = fs.readFileSync(filePath, "utf8");
+    const src = fs.readFileSync(p, "utf8");
     for (const token of mustContain) {
-      check(
-        `  ${file} contains '${token}'`,
-        src.includes(token),
-        `Token '${token}' not found — file may be corrupted or outdated`
-      );
+      check(`  ${file} contains '${token}'`, src.includes(token),
+        `Token '${token}' not found — file may be outdated. Re-run android:sync-native.`);
     }
   }
 }
 
-// ─── 3. MediaProjection permission wiring (PRIMARY PATH) ─────────────────────
-//
-// ScreenCaptureModule implements ActivityEventListener — RN's built-in mechanism
-// for receiving onActivityResult.  These checks verify that wiring is correct.
+// ─── 3. ScreenCaptureModule — permission + service API ───────────────────────
 
-section("MediaProjection permission wiring — ScreenCaptureModule (primary path)");
-
+section("ScreenCaptureModule — @ReactMethod API surface");
 if (fs.existsSync(CAPTURE_MODULE_PATH)) {
   const src = fs.readFileSync(CAPTURE_MODULE_PATH, "utf8");
 
-  check(
-    "ScreenCaptureModule implements ActivityEventListener",
-    src.includes("ActivityEventListener"),
-    "Add ', ActivityEventListener' to the class declaration and implement the interface"
-  );
+  check("requestPermission() @ReactMethod", src.includes("fun requestPermission"), null);
+  check("startCaptureService() @ReactMethod", src.includes("fun startCaptureService"), null);
+  check("stopCaptureService() @ReactMethod", src.includes("fun stopCaptureService"), null);
+  check("getCaptureServiceStatus() @ReactMethod", src.includes("fun getCaptureServiceStatus"), null);
+  check("checkWiring() @ReactMethod", src.includes("fun checkWiring"), null);
+  check("requestPermission returns map (not plain boolean)", src.includes("Arguments.createMap"),
+    "requestPermission should resolve with WritableMap { granted, permissionCached, reason? }");
+  check("startCaptureService passes resultCode + resultData to Intent",
+    src.includes("putExtra(\"resultCode\"") && src.includes("putExtra(\"resultData\""),
+    "Add: intent.putExtra(\"resultCode\", pendingResultCode) and putExtra(\"resultData\", pendingResultData)");
+  check("startCaptureService checks ScreenCaptureService.isRunning",
+    src.includes("ScreenCaptureService.isRunning"),
+    "Guard against double-starting the service");
+  check("stopCaptureService clears pendingResultCode (Android 14+ token reset)",
+    src.includes("pendingResultCode = Activity.RESULT_CANCELED"),
+    "Clear the one-session token after stop");
+  check("stopCaptureService clears pendingResultData",
+    src.includes("pendingResultData = null"),
+    "Set pendingResultData = null in stopCaptureService()");
 
-  check(
-    "ActivityEventListener registered in init block",
-    src.includes("addActivityEventListener"),
-    "Add 'reactContext.addActivityEventListener(this)' in an init { } block"
-  );
-
-  check(
-    "onMediaProjectionResult() dedup guard method present",
-    src.includes("onMediaProjectionResult"),
-    "Add 'fun onMediaProjectionResult(resultCode: Int, data: Intent?)' with resultHandled guard"
-  );
-
-  check(
-    "resultHandled deduplication guard variable present",
-    src.includes("resultHandled"),
-    "Add '@Volatile private var resultHandled = false' to prevent double-resolution"
-  );
-
-  check(
-    "onActivityResult override (ActivityEventListener) present",
-    src.includes("override fun onActivityResult"),
-    "Implement 'override fun onActivityResult(activity, requestCode, resultCode, data)' from ActivityEventListener"
-  );
-
-  check(
-    "onNewIntent override present (required by ActivityEventListener)",
-    src.includes("override fun onNewIntent"),
-    "Add 'override fun onNewIntent(intent: Intent?) {}' — required by ActivityEventListener interface"
-  );
-
-  check(
-    "permissionPromise resolved in onMediaProjectionResult",
-    src.includes("permissionPromise?.resolve"),
-    "onMediaProjectionResult() must call permissionPromise?.resolve(true/false)"
-  );
-
-  check(
-    "checkWiring() @ReactMethod present",
-    src.includes("fun checkWiring"),
-    "Add @ReactMethod checkWiring(promise: Promise) that returns wiring status map"
-  );
-
-  check(
-    "mediaProjection stored after grant",
-    src.includes("mediaProjectionManager?.getMediaProjection"),
-    "Store mediaProjection in onMediaProjectionResult so startCapture() can use it"
-  );
-
-  // Duplicate guard — should NOT have multiple onActivityResult declarations
-  const occurrences = (src.match(/override fun onActivityResult/g) || []).length;
-  check(
-    "No duplicate onActivityResult overrides in ScreenCaptureModule",
-    occurrences <= 1,
-    `Found ${occurrences} onActivityResult declarations — remove duplicates`
-  );
-} else {
-  check("ScreenCaptureModule.kt exists", false, CAPTURE_MODULE_PATH);
+  // Duplicate API checks
+  const overrideCount = (src.match(/override fun onActivityResult/g) || []).length;
+  check("No duplicate onActivityResult overrides", overrideCount <= 1,
+    `Found ${overrideCount} — remove duplicates`);
 }
 
-// ─── 4. MediaProjection permission wiring (SECONDARY PATH) ───────────────────
-//
-// MainActivity.kt is patched with an explicit onActivityResult override that
-// calls ScreenCaptureModule.onMediaProjectionResult() as belt-and-suspenders.
+// ─── 4. ScreenCaptureModule — ActivityEventListener wiring ───────────────────
 
-section("MediaProjection permission wiring — MainActivity.kt (belt-and-suspenders)");
-
-if (fs.existsSync(MAIN_ACTIVITY_PATH)) {
-  const src = fs.readFileSync(MAIN_ACTIVITY_PATH, "utf8");
-
-  check(
-    "MainActivity.kt exists",
-    true,
-    null
-  );
-
-  check(
-    "ZENLENS_ACTIVITY_RESULT_PATCH sentinel present (idempotency marker)",
-    src.includes(PATCH_SENTINEL),
-    "Run: npm run android:sync-native  (or npm run android:prebuild to re-run config plugin)"
-  );
-
-  check(
-    "MainActivity has onActivityResult override",
-    src.includes("override fun onActivityResult"),
-    "The config plugin should inject this — run: npm run android:prebuild"
-  );
-
-  check(
-    "MainActivity forwards to ScreenCaptureModule.onMediaProjectionResult",
-    src.includes("onMediaProjectionResult"),
-    "The onActivityResult override must call module?.onMediaProjectionResult(resultCode, data)"
-  );
-
-  check(
-    "MainActivity imports android.content.Intent",
-    src.includes("import android.content.Intent"),
-    "Add: import android.content.Intent"
-  );
-
-  check(
-    "MainActivity imports ScreenCaptureModule",
-    src.includes("import com.zenlens.app.ScreenCaptureModule"),
-    "Add: import com.zenlens.app.ScreenCaptureModule"
-  );
-
-  // Duplicate guard — only one onActivityResult should exist
-  const activityResultCount = (src.match(/override fun onActivityResult/g) || []).length;
-  check(
-    "No duplicate onActivityResult overrides in MainActivity",
-    activityResultCount <= 1,
-    `Found ${activityResultCount} onActivityResult declarations — duplicates will cause compile error`
-  );
-
-  // Duplicate imports guard
-  const sentinelCount = (src.match(/ZENLENS_ACTIVITY_RESULT_PATCH/g) || []).length;
-  check(
-    "No duplicate ZENLENS patch sentinels",
-    sentinelCount <= 1,
-    `Found ${sentinelCount} sentinels — prebuild has been applied more than once to the same file`
-  );
-
-} else {
-  warn(
-    "MainActivity.kt not found — skipping belt-and-suspenders checks",
-    "Primary path (ActivityEventListener) is sufficient; MainActivity patch is optional"
-  );
+section("ScreenCaptureModule — ActivityEventListener (primary result path)");
+if (fs.existsSync(CAPTURE_MODULE_PATH)) {
+  const src = fs.readFileSync(CAPTURE_MODULE_PATH, "utf8");
+  check("Implements ActivityEventListener", src.includes("ActivityEventListener"), null);
+  check("addActivityEventListener in init block", src.includes("addActivityEventListener"), null);
+  check("onNewIntent override (interface requirement)", src.includes("override fun onNewIntent"), null);
+  check("resultHandled @Volatile dedup guard", src.includes("@Volatile") && src.includes("resultHandled"), null);
+  check("onMediaProjectionResult() dedup-safe handler", src.includes("fun onMediaProjectionResult"), null);
+  check("permissionPromise?.resolve called", src.includes("permissionPromise?.resolve"), null);
 }
 
-// ─── 5. AndroidManifest.xml ───────────────────────────────────────────────────
+// ─── 5. ScreenCaptureService — foreground service lifecycle ──────────────────
+
+section("ScreenCaptureService — foreground service + MediaProjection lifecycle");
+if (fs.existsSync(CAPTURE_SERVICE_PATH)) {
+  const src = fs.readFileSync(CAPTURE_SERVICE_PATH, "utf8");
+
+  check("companion object isRunning @Volatile flag", src.includes("@Volatile") && src.includes("isRunning"), null);
+  check("isRunning set to true after service starts", src.includes("isRunning = true"), null);
+  check("isRunning set to false in onDestroy", src.includes("isRunning = false"), null);
+  check("Receives resultCode via getIntExtra", src.includes("getIntExtra(\"resultCode\""), null);
+  check("Receives resultData via getParcelableExtra", src.includes("getParcelableExtra(\"resultData\""), null);
+  check("startForeground() called in onStartCommand", src.includes("startForeground("), null);
+  check("FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION used (API 29+)",
+    src.includes("FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION"), null);
+  check("createNotificationChannel() called", src.includes("createNotificationChannel"), null);
+  check("Notification channel created for Android O+", src.includes("NotificationChannel"), null);
+  check("MediaProjectionManager.getMediaProjection() called",
+    src.includes("getMediaProjection(resultCode"), null);
+  check("MediaProjection stored as field", src.includes("mediaProjection ="), null);
+  check("MediaProjection.Callback registered", src.includes("registerCallback"), null);
+  check("MediaProjection.Callback.onStop() implemented",
+    src.includes("override fun onStop"), null);
+  check("mediaProjection?.stop() called in onDestroy", src.includes("mediaProjection?.stop()"), null);
+  check("Log.d stage logging present", src.includes("Log.d("), null);
+  check("Guards against null/invalid resultData before calling getMediaProjection",
+    src.includes("resultCode != Activity.RESULT_OK") || src.includes("resultData == null"), null);
+
+  // STOP action handling
+  check("STOP action handled in onStartCommand", src.includes("action == \"STOP\""), null);
+}
+
+// ─── 6. AndroidManifest.xml ───────────────────────────────────────────────────
 
 section("AndroidManifest.xml");
-
 if (fs.existsSync(MANIFEST_PATH)) {
   const manifest = fs.readFileSync(MANIFEST_PATH, "utf8");
+  for (const { token, label, fix } of [
+    { token: 'android.permission.FOREGROUND_SERVICE"', label: "FOREGROUND_SERVICE", fix: "Add FOREGROUND_SERVICE permission" },
+    { token: "FOREGROUND_SERVICE_MEDIA_PROJECTION", label: "FOREGROUND_SERVICE_MEDIA_PROJECTION", fix: "Add FOREGROUND_SERVICE_MEDIA_PROJECTION permission" },
+    { token: "SYSTEM_ALERT_WINDOW", label: "SYSTEM_ALERT_WINDOW", fix: "Add SYSTEM_ALERT_WINDOW permission" },
+    { token: "POST_NOTIFICATIONS", label: "POST_NOTIFICATIONS", fix: "Add POST_NOTIFICATIONS permission" },
+    { token: ".ScreenCaptureService", label: "ScreenCaptureService <service> declared", fix: "Add service declaration" },
+    { token: 'foregroundServiceType="mediaProjection"', label: 'foregroundServiceType="mediaProjection"', fix: "Required on API 29+" },
+  ]) { check(label, manifest.includes(token), fix); }
+} else { check("AndroidManifest.xml exists", false, MANIFEST_PATH); }
 
-  const requiredEntries = [
-    {
-      token: 'android.permission.FOREGROUND_SERVICE"',
-      label: "FOREGROUND_SERVICE permission",
-      fix: '<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>',
-    },
-    {
-      token: "FOREGROUND_SERVICE_MEDIA_PROJECTION",
-      label: "FOREGROUND_SERVICE_MEDIA_PROJECTION permission",
-      fix: '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>',
-    },
-    {
-      token: "SYSTEM_ALERT_WINDOW",
-      label: "SYSTEM_ALERT_WINDOW permission",
-      fix: '<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>',
-    },
-    {
-      token: "POST_NOTIFICATIONS",
-      label: "POST_NOTIFICATIONS permission (Android 13+)",
-      fix: '<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>',
-    },
-    {
-      token: ".ScreenCaptureService",
-      label: "ScreenCaptureService <service> declaration",
-      fix: '<service android:name=".ScreenCaptureService" android:foregroundServiceType="mediaProjection" android:exported="false"/>',
-    },
-    {
-      token: 'foregroundServiceType="mediaProjection"',
-      label: 'ScreenCaptureService foregroundServiceType="mediaProjection" (required API 29+)',
-      fix: 'Add android:foregroundServiceType="mediaProjection" to the <service> tag',
-    },
-  ];
+// ─── 7. MainApplication.kt ───────────────────────────────────────────────────
 
-  for (const { token, label, fix } of requiredEntries) {
-    check(label, manifest.includes(token), fix);
-  }
-} else {
-  check("AndroidManifest.xml exists", false, MANIFEST_PATH);
-}
-
-// ─── 6. MainApplication.kt — package registration ────────────────────────────
-
-section("Package registration (MainApplication.kt)");
-
+section("Package registration — MainApplication.kt");
 if (fs.existsSync(MAIN_APP_PATH)) {
   const src = fs.readFileSync(MAIN_APP_PATH, "utf8");
-  check(
-    "ZenLensPackage registered in MainApplication.kt",
-    src.includes("ZenLensPackage"),
-    "Add inside getPackages(): PackageList(this).packages.apply { add(ZenLensPackage()) }"
-  );
-  // Duplicate check
+  check("ZenLensPackage registered", src.includes("ZenLensPackage"),
+    "Add: PackageList(this).packages.apply { add(ZenLensPackage()) }");
   const count = (src.match(/ZenLensPackage/g) || []).length;
-  if (count > 2) { // import + add() = 2
-    check(
-      "No duplicate ZenLensPackage registrations",
-      false,
-      `Found ${count} ZenLensPackage references — may cause duplicate module registration`
-    );
-  }
+  if (count > 2) check("No duplicate ZenLensPackage registrations", false,
+    `Found ${count} references — remove duplicates`);
+} else { check("MainApplication.kt exists", false, MAIN_APP_PATH); }
+
+// ─── 8. MainActivity.kt ──────────────────────────────────────────────────────
+
+section("Belt-and-suspenders — MainActivity.kt");
+if (fs.existsSync(MAIN_ACTIVITY_PATH)) {
+  const src = fs.readFileSync(MAIN_ACTIVITY_PATH, "utf8");
+  check("ZENLENS_ACTIVITY_RESULT_PATCH sentinel present", src.includes(PATCH_SENTINEL),
+    "Run: npm run android:sync-native");
+  check("onActivityResult override present", src.includes("override fun onActivityResult"), null);
+  check("Forwards to onMediaProjectionResult", src.includes("onMediaProjectionResult"), null);
+  check("Imports android.content.Intent", src.includes("import android.content.Intent"), null);
+  check("Imports ScreenCaptureModule", src.includes("import com.zenlens.app.ScreenCaptureModule"), null);
+  const dupCount = (src.match(/override fun onActivityResult/g) || []).length;
+  check("No duplicate onActivityResult overrides", dupCount <= 1,
+    `Found ${dupCount} — compilation will fail`);
+  const sentinelCount = (src.match(/ZENLENS_ACTIVITY_RESULT_PATCH/g) || []).length;
+  check("No duplicate patch sentinels", sentinelCount <= 1,
+    `Found ${sentinelCount} — idempotency broken`);
 } else {
-  check("MainApplication.kt exists", false, MAIN_APP_PATH);
+  warn("MainActivity.kt not found — belt-and-suspenders checks skipped",
+    "Primary path (ActivityEventListener) is still sufficient");
 }
 
-// ─── 7. build.gradle — ML Kit dependency ─────────────────────────────────────
+// ─── 9. build.gradle ─────────────────────────────────────────────────────────
 
-section("build.gradle dependencies");
-
+section("build.gradle — ML Kit dependency");
 if (fs.existsSync(BUILD_GRADLE_PATH)) {
-  const buildGradle = fs.readFileSync(BUILD_GRADLE_PATH, "utf8");
-  check(
-    "ML Kit text-recognition dependency in android/app/build.gradle",
-    buildGradle.includes("text-recognition"),
-    'Add to dependencies block: implementation "com.google.mlkit:text-recognition:16.0.1"'
-  );
-} else {
-  check("android/app/build.gradle exists", false, BUILD_GRADLE_PATH);
+  const bg = fs.readFileSync(BUILD_GRADLE_PATH, "utf8");
+  check("ML Kit text-recognition in dependencies", bg.includes("text-recognition"),
+    'Add: implementation "com.google.mlkit:text-recognition:16.0.1"');
+} else { check("build.gradle exists", false, BUILD_GRADLE_PATH); }
+
+// ─── 10. JS wrappers ─────────────────────────────────────────────────────────
+
+section("JS wrappers — utils/ocr.ts");
+if (fs.existsSync(OCR_UTIL)) {
+  const src = fs.readFileSync(OCR_UTIL, "utf8");
+  for (const fn of [
+    "checkPermissionWiring",
+    "requestNativeMediaProjectionPermission",
+    "startNativeCaptureService",
+    "stopNativeCaptureService",
+    "getNativeCaptureServiceStatus",
+  ]) { check(`export ${fn}()`, src.includes(fn), `Add async function ${fn}() to utils/ocr.ts`); }
+  check("ZenLensCapture referenced", src.includes("ZenLensCapture"), null);
+  check("ZenLensOCR referenced", src.includes("ZenLensOCR"), null);
 }
 
-// ─── 8. JS-side cross-reference ──────────────────────────────────────────────
+// ─── 11. Device Readiness screen ─────────────────────────────────────────────
 
-section("JS-side module name cross-reference");
-
-const OCR_UTIL = path.join(ROOT, "utils", "ocr.ts");
-if (fs.existsSync(OCR_UTIL)) {
-  const ocrSrc = fs.readFileSync(OCR_UTIL, "utf8");
-  check("utils/ocr.ts references ZenLensCapture", ocrSrc.includes("ZenLensCapture"), null);
-  check("utils/ocr.ts references ZenLensOCR", ocrSrc.includes("ZenLensOCR"), null);
-  check(
-    "utils/ocr.ts has checkPermissionWiring export",
-    ocrSrc.includes("checkPermissionWiring"),
-    "Add export async function checkPermissionWiring() to utils/ocr.ts"
-  );
+section("Device Readiness screen — app/readiness.tsx");
+const readinessPath = path.join(ROOT, "app", "readiness.tsx");
+if (fs.existsSync(readinessPath)) {
+  const src = fs.readFileSync(readinessPath, "utf8");
+  for (const token of [
+    "captureModule",
+    "wiringListener",
+    "permissionGranted",
+    "serviceWiring",
+    "serviceRunning",
+    "overlayModule",
+    "ocrModule",
+    "fileExport",
+    "getNativeCaptureServiceStatus",
+    "startNativeCaptureService",
+    "stopNativeCaptureService",
+  ]) { check(`readiness.tsx has '${token}'`, src.includes(token), null); }
 }
 
 // ─── Summary ──────────────────────────────────────────────────────────────────
 
-console.log("\n" + "=".repeat(60));
+console.log("\n" + "=".repeat(68));
 console.log(`Passed: ${passed}   Failed: ${failed}   Warnings: ${warnings}`);
 
 if (failed === 0) {
   console.log(`
-✓ All checks passed. ZenLens is ready for a native APK build.
+✓ All checks passed. Foreground service handoff is fully wired.
 
-  npm run android:apk           → EAS preview APK
-  npm run android:run           → local USB device build
-
-After installing on device:
-  Home → Device Readiness       → all rows ✓
-  Home → Native Capture Test    → Android shows "Start recording?" dialog
-                                  → tap "Start now" → "Native capture granted ✓"
+Native APK test order:
+  1. npm run android:apk                    → build APK
+  2. adb install <apk>                      → install on device
+  3. Open ZenLens → Device Readiness        → all 8 rows green
+  4. Tap 'Test MediaProjection Permission'  → Android dialog appears → grant
+  5. Tap 'Test Foreground Capture Service'  → persistent notification visible
+  6. Tap 'Stop Capture Service'             → notification disappears, token cleared
+  7. If all pass → next step is single-frame capture (not OCR yet)
 `);
   process.exit(0);
 } else {
   console.error(`
 ✗ ${failed} check(s) failed.
 
-Quick fix sequence:
-  npm run android:prebuild          # regenerates android/ and runs config plugin
-  npm run android:sync-native       # re-sync Kotlin files + patch manifest + patch MainActivity
-  npm run android:verify-native     # verify again
+Fix sequence:
+  npm run android:prebuild       # regenerates android/ with config plugin
+  npm run android:sync-native    # re-sync Kotlin + patch manifests + patch MainActivity
+  npm run android:verify-native  # verify again
 `);
   process.exit(1);
 }

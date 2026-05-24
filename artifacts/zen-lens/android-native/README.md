@@ -203,39 +203,90 @@ keep the sentinel comment so the scripts remain idempotent.
 
 ---
 
-## Testing Native Capture Test on Device
+## Native APK Test Order — Foreground Service Handoff
 
-1. Install the APK on a physical Android device (emulators cannot use MediaProjection)
-2. Open ZenLens → tap **Device Readiness** on the home screen
-3. Verify the checklist:
-   - **ZenLensCapture Module** — ✓ (module registered)
-   - **ML Kit OCR Module** — ✓
-   - **System Overlay Module** — ✓
-   - **File Export** — ✓
-   - **MediaProjection Permission Wiring** — ✓ with "Wired ✓ — ActivityEventListener registered"
-4. Tap **Test MediaProjection Permission**
-5. Android displays a system dialog: **"ZenLens will start capturing everything that's displayed on your screen"**
-6. Tap **Start now** → the button changes to "Permission granted — native capture ready ✓"
-7. The wiring row updates to show `permissionGranted=true`
+Run this exact sequence on a **physical Android device** (emulators cannot use MediaProjection):
 
-### What success looks like
+**Step 1 — Build APK**
+```bash
+npm run android:apk
+```
+
+**Step 2 — Install on device**
+```bash
+adb install zen-lens.apk
+# or open EAS build URL on device and tap Install
+```
+
+**Step 3 — Open ZenLens → Device Readiness**
+
+The 8 status rows should show:
+- **ZenLensCapture Module** — ✓
+- **MediaProjection Permission Wiring** — ✓ (ActivityEventListener registered, requestCode=1001)
+- **MediaProjection Permission Granted** — ✗ (not yet granted)
+- **Foreground Capture Service Wiring** — ✓ (all 3 methods present)
+- **Foreground Capture Service Running** — ✗ (not yet started)
+- **System Overlay Module** — ✓
+- **ML Kit OCR Module** — ✓
+- **File Export** — ✓
+
+**Step 4 — Tap "Test MediaProjection Permission"**
+
+Android displays the system dialog:
+> *"ZenLens will start capturing everything that's displayed on your screen"*
+
+Tap **Start now**.
+
+Expected result: button turns green — "Granted ✓ — token cached. Start the service next."
+Row "MediaProjection Permission Granted" updates to ✓.
+
+**Step 5 — Tap "Test Foreground Capture Service"**
+
+Button is enabled now that permission is granted.
+
+Expected result:
+- Button turns green — "Service started ✓ — check Android notification bar"
+- Row "Foreground Capture Service Running" updates to ✓
+- A **persistent ZenLens notification** appears in the Android status bar
+
+**Step 6 — Tap "Stop Capture Service"**
+
+Expected result:
+- Button turns green — "Service stopped ✓ — token cleared."
+- Notification disappears
+- Row "Foreground Capture Service Running" goes back to ✗
+- Row "MediaProjection Permission Granted" goes back to ✗ (token consumed, Android 14+)
+
+**Step 7 — Checkpoint passed**
+
+If all three buttons show green in order, the foreground service handoff is **fully proven**:
 
 ```
-✓ All 4 module rows show ✓
-✓ MediaProjection Permission Wiring shows: "Wired ✓ — ActivityEventListener registered, requestCode 1001"
-✓ Native Capture Test shows: "Permission granted — native capture ready ✓"
-✓ Wiring row updates to: "Wired ✓ — permission already granted for this session"
+✓ Permission dialog appeared and was granted
+✓ ScreenCaptureModule stored resultCode + resultData
+✓ ScreenCaptureService received the grant via Intent extras
+✓ startForeground() called — persistent notification visible
+✓ MediaProjection object created and callback registered
+✓ Service stopped cleanly — notification gone, token cleared
+✓ Device Readiness rows report accurate live status
 ```
+
+Next build step: **single-frame capture via VirtualDisplay** — not OCR yet.
+
+---
 
 ### What failure looks like and what to do
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| All 4 module rows show ✗ | Expo Go or modules not registered | Run `android:prebuild && android:apk` |
-| ZenLensCapture ✓ but wiring row shows "wiring is incomplete" | Old `ScreenCaptureModule.kt` without `checkWiring()` | Rebuild APK with updated module |
-| Dialog appears but promise never resolves | `ActivityEventListener` not registered | Check `init { reactContext.addActivityEventListener(this) }` in `ScreenCaptureModule.kt` |
-| Dialog appears, user grants, JS gets `false` | Wrong result handling branch | Check `onMediaProjectionResult()` — must check `resultCode == Activity.RESULT_OK && data != null` |
-| "No activity available" error | Module called before activity starts | Ensure app is fully foregrounded before calling `requestPermission()` |
+| All module rows show ✗ | Expo Go or modules not registered | Build and install native APK |
+| Module ✓ but service wiring row shows "incomplete" | Old ScreenCaptureModule.kt without service methods | Rebuild APK with updated Kotlin |
+| Permission dialog never appears | No activity or `currentActivity` null | Ensure app is fully foregrounded |
+| Dialog appears, promise never resolves | ActivityEventListener not registered | Check `init { addActivityEventListener(this) }` |
+| Dialog grants but JS gets `granted: false` | Wrong result handling | Check `resultCode == RESULT_OK && data != null` in `onMediaProjectionResult()` |
+| Service starts but notification never appears | startForeground() not called within 5s | Check logcat for "startForeground called" log line |
+| `MissingForegroundServiceTypeException` | `foregroundServiceType` missing in manifest | Run `android:sync-native` then rebuild |
+| Service starts fine but second session fails | Android 14+ token reuse | Grant permission again — this is expected, not a bug |
 
 ---
 

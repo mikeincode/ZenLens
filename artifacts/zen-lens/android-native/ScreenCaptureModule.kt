@@ -14,112 +14,80 @@ import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.util.Base64
 import android.util.DisplayMetrics
+import android.util.Log
 import android.view.WindowManager
 import com.facebook.react.bridge.*
-import com.facebook.react.modules.core.DeviceEventManagerModule
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 
+private const val TAG = "ZenLensCapture"
+
 /**
- * ScreenCaptureModule
+ * ScreenCaptureModule — NativeModules.ZenLensCapture
  *
- * Bridges the React Native layer to Android's MediaProjection API.
- * Exposed as NativeModules.ZenLensCapture in JavaScript.
+ * Checkpoint: foreground service handoff.
+ * Frame capture (VirtualDisplay / ImageReader) is intentionally not yet activated.
  *
- * ── Permission flow ──────────────────────────────────────────────────────────
+ * JS API:
  *
- * This module implements ActivityEventListener — React Native's built-in
- * mechanism for receiving onActivityResult callbacks.  RN automatically forwards
- * every Activity result to all registered listeners; no MainActivity patching is
- * strictly required, but the config plugin also patches MainActivity as a
- * belt-and-suspenders measure (see withZenLensNativeModules.js).
+ *   requestPermission()
+ *     → { granted: boolean, permissionCached: boolean, reason?: string }
  *
- * To prevent double-invocation (from both ActivityEventListener AND the explicit
- * MainActivity forward), onMediaProjectionResult() carries a short-lived
- * "resultHandled" guard that makes it idempotent.
+ *   startCaptureService()
+ *     → { started: boolean, reason?: string }
  *
- * JS usage:
- *   import { NativeModules } from 'react-native';
- *   const { ZenLensCapture } = NativeModules;
+ *   stopCaptureService()
+ *     → { stopped: boolean }
  *
- *   // Verify wiring before attempting capture
- *   const wiring = await ZenLensCapture.checkWiring();
- *   // → { activityListenerRegistered: true, requestCode: 1001, permissionGranted: false }
+ *   getCaptureServiceStatus()
+ *     → { permissionGranted: boolean, serviceRunning: boolean, hasProjectionToken: boolean }
  *
- *   // Request MediaProjection permission (shows Android system dialog)
- *   const granted: boolean = await ZenLensCapture.requestPermission();
+ *   checkWiring()
+ *     → { activityListenerRegistered: boolean, requestCode: number, permissionGranted: boolean }
  *
- *   // Start capture with crop rect (coordinates in screen pixels)
- *   await ZenLensCapture.startCapture(x, y, width, height);
- *
- *   // Capture a single frame as base64 PNG of the cropped area
- *   const base64: string | null = await ZenLensCapture.captureFrame();
- *
- *   // Stop capture and release resources
- *   await ZenLensCapture.stopCapture();
- *
- *   // Check overlay permission (SYSTEM_ALERT_WINDOW)
- *   const overlayGranted: boolean = await ZenLensCapture.requestOverlayPermission();
+ *   requestOverlayPermission() → boolean
  */
 class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext), ActivityEventListener {
 
     companion object {
         const val MODULE_NAME = "ZenLensCapture"
-        /** Request code used with startActivityForResult for MediaProjection. */
         const val MEDIA_PROJECTION_REQUEST = 1001
-        const val NOTIFICATION_CHANNEL_ID = "zenlens_capture"
-        const val NOTIFICATION_ID = 42
     }
 
-    // ─── State ────────────────────────────────────────────────────────────────
+    // ── State ─────────────────────────────────────────────────────────────────
 
     private var mediaProjectionManager: MediaProjectionManager? = null
-    private var mediaProjection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var imageReader: ImageReader? = null
 
-    private var cropX = 0
-    private var cropY = 0
-    private var cropWidth = 800
-    private var cropHeight = 600
-    private var screenWidth = 0
-    private var screenHeight = 0
-    private var screenDensity = 0
-
-    /** Pending JS promise for requestPermission(). Resolved in onMediaProjectionResult(). */
+    /** Pending JS promise from requestPermission(). Resolved in onMediaProjectionResult(). */
     private var permissionPromise: Promise? = null
 
     /**
-     * Deduplication guard — prevents double-resolving the promise when both
-     * ActivityEventListener AND the explicit MainActivity forward fire for the
-     * same result.  Reset to false 500ms after first invocation.
+     * Dedup guard — prevents double-resolution when both ActivityEventListener AND
+     * the MainActivity explicit forward fire for the same result.
      */
     @Volatile private var resultHandled = false
 
     /**
-     * Stored permission grant, used when starting the foreground service later.
-     * Non-null means the user has granted MediaProjection for this session.
+     * Stored grant from the last successful requestPermission().
+     * Cleared by stopCaptureService() — Android 14+ tokens are one-session-use.
      */
     private var pendingResultCode: Int = Activity.RESULT_CANCELED
     private var pendingResultData: Intent? = null
 
-    /** True once ActivityEventListener has been registered. */
     private var activityListenerRegistered = false
 
-    // ─── Init ─────────────────────────────────────────────────────────────────
+    // ── Init ──────────────────────────────────────────────────────────────────
 
     init {
         reactContext.addActivityEventListener(this)
         activityListenerRegistered = true
+        Log.d(TAG, "ScreenCaptureModule init — ActivityEventListener registered")
     }
 
     override fun getName() = MODULE_NAME
 
-    // ─── ActivityEventListener ─────────────────────────────────────────────────
-    //
-    // React Native automatically calls these for every activity result.
-    // This is the PRIMARY path for receiving the MediaProjection grant.
+    // ── ActivityEventListener (primary result path) ────────────────────────────
 
     override fun onActivityResult(
         activity: Activity?,
@@ -128,84 +96,65 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
         data: Intent?
     ) {
         if (requestCode == MEDIA_PROJECTION_REQUEST) {
+            Log.d(TAG, "onActivityResult: requestCode=$requestCode resultCode=$resultCode (primary path)")
             onMediaProjectionResult(resultCode, data)
         }
     }
 
-    override fun onNewIntent(intent: Intent?) {
-        // No-op — required by ActivityEventListener interface
-    }
+    override fun onNewIntent(intent: Intent?) {}
 
-    // ─── Permission result handler (idempotent) ────────────────────────────────
-    //
-    // Called from both:
-    //   • ActivityEventListener.onActivityResult (primary, always fires)
-    //   • MainActivity.onActivityResult patch (belt-and-suspenders)
-    //
-    // The resultHandled guard ensures only the first call does anything.
+    // ── Permission result (idempotent, called from both paths) ─────────────────
 
     fun onMediaProjectionResult(resultCode: Int, data: Intent?) {
-        if (resultHandled) return
+        if (resultHandled) {
+            Log.d(TAG, "onMediaProjectionResult: already handled — skipping duplicate")
+            return
+        }
         resultHandled = true
 
-        // Reset guard after 500ms so the module can handle a second permission request
+        // Reset guard after 500ms so a second requestPermission() call can work
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
             resultHandled = false
         }, 500)
 
+        val result = Arguments.createMap()
+
         if (resultCode == Activity.RESULT_OK && data != null) {
-            // Store the grant so startCapture() can use it to create the MediaProjection
+            Log.d(TAG, "onMediaProjectionResult: GRANTED — storing pendingResultCode/Data")
             pendingResultCode = resultCode
             pendingResultData = data
-            // Create the MediaProjection object immediately (it must be created in the
-            // same process that received the result, before the foreground service starts)
-            mediaProjection = mediaProjectionManager?.getMediaProjection(resultCode, data)
-            permissionPromise?.resolve(true)
+            result.putBoolean("granted", true)
+            result.putBoolean("permissionCached", true)
+            permissionPromise?.resolve(result)
         } else {
+            Log.d(TAG, "onMediaProjectionResult: DENIED or cancelled")
             pendingResultCode = Activity.RESULT_CANCELED
             pendingResultData = null
-            mediaProjection = null
-            permissionPromise?.resolve(false)
+            result.putBoolean("granted", false)
+            result.putBoolean("permissionCached", false)
+            result.putString("reason", "User denied or cancelled the MediaProjection permission dialog")
+            permissionPromise?.resolve(result)
         }
         permissionPromise = null
     }
 
-    // ─── @ReactMethod: Permission ──────────────────────────────────────────────
+    // ── @ReactMethod: requestPermission ───────────────────────────────────────
 
     /**
-     * Verifies the permission wiring is in place without actually requesting
-     * anything from the user.  Call this from the Device Readiness screen.
-     *
-     * Returns a JS object:
-     *   {
-     *     activityListenerRegistered: Boolean,  // always true if module loaded correctly
-     *     requestCode: Int,                     // MEDIA_PROJECTION_REQUEST constant value
-     *     permissionGranted: Boolean            // whether permission is currently held
-     *   }
-     */
-    @ReactMethod
-    fun checkWiring(promise: Promise) {
-        val result = Arguments.createMap().apply {
-            putBoolean("activityListenerRegistered", activityListenerRegistered)
-            putInt("requestCode", MEDIA_PROJECTION_REQUEST)
-            putBoolean("permissionGranted", mediaProjection != null)
-        }
-        promise.resolve(result)
-    }
-
-    /**
-     * Requests MediaProjection permission from Android.
-     * Shows the system "Start recording?" dialog.
-     *
-     * Resolves to:
-     *   true  — permission granted, mediaProjection object is stored
-     *   false — user denied or activity unavailable
+     * Opens the Android "Start recording?" system dialog.
+     * Returns { granted: boolean, permissionCached: boolean, reason?: string }.
+     * The resultCode + resultData are stored for startCaptureService().
      */
     @ReactMethod
     fun requestPermission(promise: Promise) {
         val activity = currentActivity
         if (activity == null) {
-            promise.reject("NO_ACTIVITY", "No activity available — ensure the app is in the foreground")
+            val err = Arguments.createMap().apply {
+                putBoolean("granted", false)
+                putBoolean("permissionCached", false)
+                putString("reason", "No activity available — ensure the app is fully foregrounded")
+            }
+            promise.resolve(err)
             return
         }
 
@@ -214,13 +163,134 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
         ) as MediaProjectionManager
 
         permissionPromise = promise
-        resultHandled = false  // Reset so the result can be received
+        resultHandled = false
 
+        Log.d(TAG, "requestPermission: launching MediaProjection intent (request=$MEDIA_PROJECTION_REQUEST)")
         val intent = mediaProjectionManager!!.createScreenCaptureIntent()
         activity.startActivityForResult(intent, MEDIA_PROJECTION_REQUEST)
-        // Result delivered via onMediaProjectionResult() — either through
-        // ActivityEventListener (primary) or MainActivity patch (secondary)
     }
+
+    // ── @ReactMethod: startCaptureService ─────────────────────────────────────
+
+    /**
+     * Starts ScreenCaptureService with the stored MediaProjection grant.
+     * Returns { started: boolean, reason?: string }.
+     *
+     * Fails clearly if permission has not been granted yet.
+     * After stop, Android 14+ invalidates the token — must call requestPermission() again.
+     */
+    @ReactMethod
+    fun startCaptureService(promise: Promise) {
+        if (pendingResultCode != Activity.RESULT_OK || pendingResultData == null) {
+            val err = Arguments.createMap().apply {
+                putBoolean("started", false)
+                putString("reason", "MediaProjection permission not granted — call requestPermission() first")
+            }
+            promise.resolve(err)
+            return
+        }
+
+        if (ScreenCaptureService.isRunning) {
+            val err = Arguments.createMap().apply {
+                putBoolean("started", false)
+                putString("reason", "ScreenCaptureService is already running — call stopCaptureService() first")
+            }
+            promise.resolve(err)
+            return
+        }
+
+        try {
+            Log.d(TAG, "startCaptureService: starting ScreenCaptureService")
+            val serviceIntent = Intent(reactContext, ScreenCaptureService::class.java).apply {
+                putExtra("resultCode", pendingResultCode)
+                putExtra("resultData", pendingResultData)
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                reactContext.startForegroundService(serviceIntent)
+            } else {
+                reactContext.startService(serviceIntent)
+            }
+
+            val ok = Arguments.createMap().apply {
+                putBoolean("started", true)
+            }
+            promise.resolve(ok)
+        } catch (e: Exception) {
+            Log.e(TAG, "startCaptureService failed: ${e.message}")
+            val err = Arguments.createMap().apply {
+                putBoolean("started", false)
+                putString("reason", e.message ?: "Unknown error starting service")
+            }
+            promise.resolve(err)
+        }
+    }
+
+    // ── @ReactMethod: stopCaptureService ──────────────────────────────────────
+
+    /**
+     * Stops ScreenCaptureService and clears the one-session MediaProjection token.
+     * Android 14+ does not allow reusing the same token — a fresh requestPermission()
+     * is required before the next startCaptureService() call.
+     */
+    @ReactMethod
+    fun stopCaptureService(promise: Promise) {
+        try {
+            Log.d(TAG, "stopCaptureService: stopping ScreenCaptureService")
+            val serviceIntent = Intent(reactContext, ScreenCaptureService::class.java)
+            reactContext.stopService(serviceIntent)
+
+            // Clear the one-session token per Android 14+ requirements
+            pendingResultCode = Activity.RESULT_CANCELED
+            pendingResultData = null
+
+            val ok = Arguments.createMap().apply {
+                putBoolean("stopped", true)
+            }
+            promise.resolve(ok)
+        } catch (e: Exception) {
+            Log.e(TAG, "stopCaptureService failed: ${e.message}")
+            val ok = Arguments.createMap().apply {
+                putBoolean("stopped", false)
+            }
+            promise.resolve(ok)
+        }
+    }
+
+    // ── @ReactMethod: getCaptureServiceStatus ──────────────────────────────────
+
+    /**
+     * Returns live status without any side effects.
+     * { permissionGranted: boolean, serviceRunning: boolean, hasProjectionToken: boolean }
+     */
+    @ReactMethod
+    fun getCaptureServiceStatus(promise: Promise) {
+        val result = Arguments.createMap().apply {
+            putBoolean("permissionGranted", pendingResultCode == Activity.RESULT_OK && pendingResultData != null)
+            putBoolean("serviceRunning", ScreenCaptureService.isRunning)
+            putBoolean("hasProjectionToken", pendingResultData != null)
+        }
+        promise.resolve(result)
+    }
+
+    // ── @ReactMethod: checkWiring ──────────────────────────────────────────────
+
+    /**
+     * Returns wiring diagnostics without side effects.
+     * Used by the Device Readiness screen.
+     */
+    @ReactMethod
+    fun checkWiring(promise: Promise) {
+        val result = Arguments.createMap().apply {
+            putBoolean("activityListenerRegistered", activityListenerRegistered)
+            putInt("requestCode", MEDIA_PROJECTION_REQUEST)
+            putBoolean("permissionGranted", pendingResultCode == Activity.RESULT_OK && pendingResultData != null)
+            putBoolean("serviceMethodsPresent", true)  // Always true if this module version is loaded
+        }
+        promise.resolve(result)
+    }
+
+    // ── @ReactMethod: requestOverlayPermission ────────────────────────────────
 
     @ReactMethod
     fun requestOverlayPermission(promise: Promise) {
@@ -233,7 +303,6 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
                 )
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 reactContext.startActivity(intent)
-                // Poll after 3 s — user must manually toggle in Settings
                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                     promise.resolve(android.provider.Settings.canDrawOverlays(reactContext))
                 }, 3000)
@@ -245,131 +314,35 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // ─── @ReactMethod: Capture lifecycle ──────────────────────────────────────
+    // ── Legacy frame capture methods (kept for CaptureContext compatibility) ───
+    // These will be wired to VirtualDisplay in the next checkpoint (single-frame capture).
+
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+    private var screenWidth = 0
+    private var screenHeight = 0
+    private var screenDensity = 0
+    private var cropX = 0; private var cropY = 0
+    private var cropWidth = 800; private var cropHeight = 600
 
     @ReactMethod
     fun startCapture(x: Int, y: Int, width: Int, height: Int, promise: Promise) {
-        if (mediaProjection == null) {
-            promise.reject(
-                "NOT_PERMITTED",
-                "MediaProjection not granted — call requestPermission() first and wait for it to resolve true"
-            )
-            return
-        }
-        initMetrics()
-        cropX = x; cropY = y; cropWidth = width; cropHeight = height
-
-        // Start the foreground service (Android requires it for screen capture)
-        val serviceIntent = Intent(reactContext, ScreenCaptureService::class.java).apply {
-            putExtra("cropX", cropX)
-            putExtra("cropY", cropY)
-            putExtra("cropWidth", cropWidth)
-            putExtra("cropHeight", cropHeight)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            reactContext.startForegroundService(serviceIntent)
-        } else {
-            reactContext.startService(serviceIntent)
-        }
-
-        // Create the ImageReader and VirtualDisplay
-        imageReader = ImageReader.newInstance(
-            screenWidth, screenHeight,
-            PixelFormat.RGBA_8888, 2
-        )
-        virtualDisplay = mediaProjection!!.createVirtualDisplay(
-            "ZenLensCapture",
-            screenWidth, screenHeight, screenDensity,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader!!.surface, null, null
-        )
-        promise.resolve(true)
+        // Next checkpoint: wire to VirtualDisplay using ScreenCaptureService.getMediaProjection()
+        promise.reject("NOT_IMPLEMENTED", "Frame capture not yet implemented — use startCaptureService() for this checkpoint")
     }
 
     @ReactMethod
     fun captureFrame(promise: Promise) {
-        val reader = imageReader
-        if (reader == null) {
-            promise.reject("NOT_CAPTURING", "Capture not started — call startCapture() first")
-            return
-        }
-
-        val image: Image? = reader.acquireLatestImage()
-        if (image == null) {
-            promise.resolve(null)
-            return
-        }
-
-        try {
-            val planes = image.planes
-            val buffer: ByteBuffer = planes[0].buffer
-            val pixelStride: Int = planes[0].pixelStride
-            val rowStride: Int = planes[0].rowStride
-            val rowPadding: Int = rowStride - pixelStride * screenWidth
-
-            val bitmap = Bitmap.createBitmap(
-                screenWidth + rowPadding / pixelStride,
-                screenHeight,
-                Bitmap.Config.ARGB_8888
-            )
-            bitmap.copyPixelsFromBuffer(buffer)
-
-            val safeCropX = cropX.coerceIn(0, screenWidth - 1)
-            val safeCropY = cropY.coerceIn(0, screenHeight - 1)
-            val safeCropW = cropWidth.coerceIn(1, screenWidth - safeCropX)
-            val safeCropH = cropHeight.coerceIn(1, screenHeight - safeCropY)
-
-            val cropped = Bitmap.createBitmap(bitmap, safeCropX, safeCropY, safeCropW, safeCropH)
-            bitmap.recycle()
-
-            val baos = ByteArrayOutputStream()
-            cropped.compress(Bitmap.CompressFormat.PNG, 90, baos)
-            cropped.recycle()
-
-            val base64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-            promise.resolve(base64)
-        } finally {
-            image.close()
-        }
+        promise.reject("NOT_IMPLEMENTED", "Frame capture not yet implemented — complete foreground service handoff first")
     }
 
     @ReactMethod
     fun stopCapture(promise: Promise) {
-        virtualDisplay?.release()
-        virtualDisplay = null
-        imageReader?.close()
-        imageReader = null
-        mediaProjection?.stop()
-        mediaProjection = null
-        pendingResultCode = Activity.RESULT_CANCELED
-        pendingResultData = null
-
-        val serviceIntent = Intent(reactContext, ScreenCaptureService::class.java)
-        reactContext.stopService(serviceIntent)
-
-        promise.resolve(null)
+        // Delegate to the service-based stop
+        stopCaptureService(promise)
     }
 
-    // ─── Private helpers ──────────────────────────────────────────────────────
-
-    private fun initMetrics() {
-        val wm = reactContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bounds = wm.currentWindowMetrics.bounds
-            screenWidth = bounds.width()
-            screenHeight = bounds.height()
-            screenDensity = reactContext.resources.displayMetrics.densityDpi
-        } else {
-            val metrics = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            wm.defaultDisplay.getMetrics(metrics)
-            screenWidth = metrics.widthPixels
-            screenHeight = metrics.heightPixels
-            screenDensity = metrics.densityDpi
-        }
-    }
-
-    // ─── RN event bridge stubs ────────────────────────────────────────────────
+    // ── RN bridge stubs ───────────────────────────────────────────────────────
 
     @ReactMethod
     fun addListener(eventName: String) {}

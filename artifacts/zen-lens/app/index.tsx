@@ -5,7 +5,6 @@ import { router } from "expo-router";
 import React, { useState } from "react";
 import {
   ActivityIndicator,
-  NativeModules,
   Platform,
   Pressable,
   ScrollView,
@@ -17,10 +16,39 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { StatusPill } from "@/components/StatusPill";
 import { useCapture } from "@/context/CaptureContext";
 import { useColors } from "@/hooks/useColors";
+import {
+  requestNativeMediaProjectionPermission,
+  startNativeCaptureService,
+  stopNativeCaptureService,
+} from "@/utils/ocr";
 
 const isExpoGo =
   Constants.appOwnership === "expo" ||
   Constants.executionEnvironment === "storeClient";
+
+type TestState = "idle" | "busy" | "ok" | "err";
+
+interface NativeTestState {
+  permission: TestState;
+  permissionMsg: string;
+  service: TestState;
+  serviceMsg: string;
+  stop: TestState;
+  stopMsg: string;
+  permissionGranted: boolean;
+  serviceRunning: boolean;
+}
+
+const INIT: NativeTestState = {
+  permission: "idle",
+  permissionMsg: "",
+  service: "idle",
+  serviceMsg: "",
+  stop: "idle",
+  stopMsg: "",
+  permissionGranted: false,
+  serviceRunning: false,
+};
 
 export default function HomeScreen() {
   const colors = useColors();
@@ -35,9 +63,7 @@ export default function HomeScreen() {
     isSimulated,
   } = useCapture();
 
-  const [mpTestState, setMpTestState] = useState<
-    "idle" | "testing" | "success" | "failed"
-  >("idle");
+  const [nt, setNt] = useState<NativeTestState>(INIT);
 
   const isActive = state === "capturing" || state === "paused";
   const wordCount = transcript.trim()
@@ -46,6 +72,8 @@ export default function HomeScreen() {
   const lineCount = transcript.trim()
     ? transcript.trim().split("\n").filter((l) => l.trim()).length
     : 0;
+
+  // ── Handlers ────────────────────────────────────────────────────────────────
 
   async function handleStartCapture() {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
@@ -57,48 +85,124 @@ export default function HomeScreen() {
     await stopCapture();
   }
 
-  async function handleOpenTranscript() {
-    await Haptics.selectionAsync();
-    router.push("/transcript");
-  }
-
-  async function handleNativeCaptureTest() {
+  async function handleTestPermission() {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     if (isExpoGo) {
-      setMpTestState("failed");
+      setNt((p) => ({
+        ...p,
+        permission: "err",
+        permissionMsg: "Not available in Expo Go — build the native APK first.",
+      }));
       return;
     }
-    setMpTestState("testing");
-    try {
-      const mod = NativeModules.ZenLensCapture;
-      if (!mod) {
-        setMpTestState("failed");
-        return;
-      }
-      const granted = await mod.requestPermission();
-      setMpTestState(granted ? "success" : "failed");
-    } catch {
-      setMpTestState("failed");
+    setNt((p) => ({ ...p, permission: "busy", permissionMsg: "" }));
+    const result = await requestNativeMediaProjectionPermission();
+    if (!result) {
+      setNt((p) => ({
+        ...p,
+        permission: "err",
+        permissionMsg: "ZenLensCapture module not found — rebuild APK.",
+        permissionGranted: false,
+      }));
+      return;
+    }
+    if (result.granted) {
+      setNt((p) => ({
+        ...p,
+        permission: "ok",
+        permissionMsg: "Granted ✓ — token cached. Tap 'Start Service' next.",
+        permissionGranted: true,
+      }));
+    } else {
+      setNt((p) => ({
+        ...p,
+        permission: "err",
+        permissionMsg: result.reason ?? "Permission denied.",
+        permissionGranted: false,
+      }));
     }
   }
 
-  const mpTestColor =
-    mpTestState === "success"
-      ? colors.success
-      : mpTestState === "failed"
-        ? colors.destructive
-        : colors.accent;
+  async function handleStartService() {
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setNt((p) => ({ ...p, service: "busy", serviceMsg: "" }));
+    const result = await startNativeCaptureService();
+    if (!result) {
+      setNt((p) => ({
+        ...p,
+        service: "err",
+        serviceMsg: "startCaptureService() not found — rebuild APK.",
+        serviceRunning: false,
+      }));
+      return;
+    }
+    if (result.started) {
+      setNt((p) => ({
+        ...p,
+        service: "ok",
+        serviceMsg: "Service started ✓ — check Android notification bar.",
+        serviceRunning: true,
+      }));
+    } else {
+      setNt((p) => ({
+        ...p,
+        service: "err",
+        serviceMsg: result.reason ?? "Service failed to start.",
+        serviceRunning: false,
+      }));
+    }
+  }
 
-  const mpTestLabel =
-    mpTestState === "testing"
-      ? "Requesting MediaProjection…"
-      : mpTestState === "success"
-        ? "Native capture granted ✓"
-        : mpTestState === "failed"
-          ? isExpoGo
-            ? "Native capture unavailable in Expo Go"
-            : "Permission denied or module missing"
-          : "Native Capture Test";
+  async function handleStopService() {
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setNt((p) => ({ ...p, stop: "busy", stopMsg: "" }));
+    const result = await stopNativeCaptureService();
+    if (!result) {
+      setNt((p) => ({
+        ...p,
+        stop: "err",
+        stopMsg: "stopCaptureService() not found — rebuild APK.",
+      }));
+      return;
+    }
+    if (result.stopped) {
+      setNt((p) => ({
+        ...p,
+        stop: "ok",
+        stopMsg: "Service stopped ✓ — token cleared. Re-request permission for next session.",
+        serviceRunning: false,
+        permissionGranted: false,
+        permission: "idle",
+        permissionMsg: "",
+        service: "idle",
+        serviceMsg: "",
+      }));
+    } else {
+      setNt((p) => ({ ...p, stop: "err", stopMsg: "Stop returned false — check logs." }));
+    }
+  }
+
+  // ── Test button helpers ──────────────────────────────────────────────────────
+
+  function testColor(s: TestState) {
+    if (s === "ok") return colors.success;
+    if (s === "err") return colors.destructive;
+    return colors.accent;
+  }
+
+  function testBg(s: TestState) {
+    if (s === "ok") return `${colors.success}14`;
+    if (s === "err") return `${colors.destructive}14`;
+    return `${colors.accent}10`;
+  }
+
+  function testBorder(s: TestState) {
+    if (s === "ok") return `${colors.success}44`;
+    if (s === "err") return `${colors.destructive}44`;
+    return `${colors.accent}30`;
+  }
+
+  // ── Render ───────────────────────────────────────────────────────────────────
 
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
@@ -106,14 +210,8 @@ export default function HomeScreen() {
         contentContainerStyle={[
           styles.scroll,
           {
-            paddingTop:
-              insets.top +
-              (Platform.OS === "web" ? 67 : 0) +
-              16,
-            paddingBottom:
-              insets.bottom +
-              (Platform.OS === "web" ? 34 : 0) +
-              24,
+            paddingTop: insets.top + (Platform.OS === "web" ? 67 : 0) + 16,
+            paddingBottom: insets.bottom + (Platform.OS === "web" ? 34 : 0) + 24,
           },
         ]}
         showsVerticalScrollIndicator={false}
@@ -121,9 +219,7 @@ export default function HomeScreen() {
         {/* Header */}
         <View style={styles.header}>
           <View>
-            <Text style={[styles.appName, { color: colors.foreground }]}>
-              ZenLens
-            </Text>
+            <Text style={[styles.appName, { color: colors.foreground }]}>ZenLens</Text>
             <Text style={[styles.tagline, { color: colors.mutedForeground }]}>
               Scrolling OCR clipboard
             </Text>
@@ -132,10 +228,7 @@ export default function HomeScreen() {
             onPress={() => router.push("/settings")}
             style={({ pressed }) => [
               styles.settingsBtn,
-              {
-                backgroundColor: colors.secondary,
-                opacity: pressed ? 0.7 : 1,
-              },
+              { backgroundColor: colors.secondary, opacity: pressed ? 0.7 : 1 },
             ]}
           >
             <Feather name="settings" size={18} color={colors.mutedForeground} />
@@ -148,12 +241,8 @@ export default function HomeScreen() {
           style={({ pressed }) => [
             styles.modeBanner,
             {
-              backgroundColor: isSimulated
-                ? `${colors.warning}14`
-                : `${colors.success}14`,
-              borderColor: isSimulated
-                ? `${colors.warning}40`
-                : `${colors.success}40`,
+              backgroundColor: isSimulated ? `${colors.warning}14` : `${colors.success}14`,
+              borderColor: isSimulated ? `${colors.warning}40` : `${colors.success}40`,
               opacity: pressed ? 0.8 : 1,
             },
           ]}
@@ -163,22 +252,12 @@ export default function HomeScreen() {
             size={14}
             color={isSimulated ? colors.warning : colors.success}
           />
-          <Text
-            style={[
-              styles.modeBannerText,
-              { color: isSimulated ? colors.warning : colors.success },
-            ]}
-          >
+          <Text style={[styles.modeBannerText, { color: isSimulated ? colors.warning : colors.success }]}>
             {isSimulated
               ? "Expo Go demo mode — simulated capture only"
               : "Native build mode — real MediaProjection capture available"}
           </Text>
-          <Feather
-            name="chevron-right"
-            size={13}
-            color={isSimulated ? colors.warning : colors.success}
-            style={{ opacity: 0.7 }}
-          />
+          <Feather name="chevron-right" size={13} color={isSimulated ? colors.warning : colors.success} style={{ opacity: 0.7 }} />
         </Pressable>
 
         {/* Status */}
@@ -186,33 +265,19 @@ export default function HomeScreen() {
           <StatusPill state={state} label={isActive ? ocrStatus : ""} />
         </View>
 
-        {/* Stats cards */}
+        {/* Stats */}
         {isActive && (
           <View style={styles.statsRow}>
-            <View style={[styles.statCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-              <Text style={[styles.statValue, { color: colors.foreground }]}>
-                {frameCount}
-              </Text>
-              <Text style={[styles.statLabel, { color: colors.mutedForeground }]}>
-                Frames
-              </Text>
-            </View>
-            <View style={[styles.statCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-              <Text style={[styles.statValue, { color: colors.accent }]}>
-                {appendedCount}
-              </Text>
-              <Text style={[styles.statLabel, { color: colors.mutedForeground }]}>
-                Appended
-              </Text>
-            </View>
-            <View style={[styles.statCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-              <Text style={[styles.statValue, { color: colors.foreground }]}>
-                {wordCount}
-              </Text>
-              <Text style={[styles.statLabel, { color: colors.mutedForeground }]}>
-                Words
-              </Text>
-            </View>
+            {[
+              { value: frameCount, label: "Frames", color: colors.foreground },
+              { value: appendedCount, label: "Appended", color: colors.accent },
+              { value: wordCount, label: "Words", color: colors.foreground },
+            ].map(({ value, label, color }) => (
+              <View key={label} style={[styles.statCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+                <Text style={[styles.statValue, { color }]}>{value}</Text>
+                <Text style={[styles.statLabel, { color: colors.mutedForeground }]}>{label}</Text>
+              </View>
+            ))}
           </View>
         )}
 
@@ -222,77 +287,42 @@ export default function HomeScreen() {
             onPress={handleStartCapture}
             style={({ pressed }) => [
               styles.startButton,
-              {
-                backgroundColor: colors.primary,
-                opacity: pressed ? 0.85 : 1,
-                transform: [{ scale: pressed ? 0.98 : 1 }],
-              },
+              { backgroundColor: colors.primary, opacity: pressed ? 0.85 : 1, transform: [{ scale: pressed ? 0.98 : 1 }] },
             ]}
           >
             <Feather name="radio" size={22} color={colors.primaryForeground} />
-            <Text
-              style={[
-                styles.startButtonText,
-                { color: colors.primaryForeground },
-              ]}
-            >
-              Start Capture
-            </Text>
+            <Text style={[styles.startButtonText, { color: colors.primaryForeground }]}>Start Capture</Text>
           </Pressable>
         ) : (
           <Pressable
             onPress={handleStopCapture}
             style={({ pressed }) => [
               styles.stopButton,
-              {
-                backgroundColor: `${colors.destructive}18`,
-                borderColor: colors.destructive,
-                opacity: pressed ? 0.85 : 1,
-              },
+              { backgroundColor: `${colors.destructive}18`, borderColor: colors.destructive, opacity: pressed ? 0.85 : 1 },
             ]}
           >
             <Feather name="square" size={20} color={colors.destructive} />
-            <Text style={[styles.stopButtonText, { color: colors.destructive }]}>
-              Stop Capture
-            </Text>
+            <Text style={[styles.stopButtonText, { color: colors.destructive }]}>Stop Capture</Text>
           </Pressable>
         )}
 
-        {/* Secondary actions */}
+        {/* Secondary nav */}
         <View style={styles.secondaryActions}>
           <Pressable
-            onPress={handleOpenTranscript}
+            onPress={() => router.push("/transcript")}
             style={({ pressed }) => [
               styles.secondaryBtn,
-              {
-                backgroundColor: colors.card,
-                borderColor: colors.border,
-                opacity: pressed ? 0.7 : 1,
-              },
+              { backgroundColor: colors.card, borderColor: colors.border, opacity: pressed ? 0.7 : 1 },
             ]}
           >
             <Feather name="file-text" size={18} color={colors.primary} />
-            <Text
-              style={[styles.secondaryBtnText, { color: colors.foreground }]}
-            >
-              Transcript
-            </Text>
+            <Text style={[styles.secondaryBtnText, { color: colors.foreground }]}>Transcript</Text>
             {lineCount > 0 && (
-              <View
-                style={[
-                  styles.badge,
-                  { backgroundColor: colors.primary },
-                ]}
-              >
+              <View style={[styles.badge, { backgroundColor: colors.primary }]}>
                 <Text style={styles.badgeText}>{lineCount}</Text>
               </View>
             )}
-            <Feather
-              name="chevron-right"
-              size={16}
-              color={colors.mutedForeground}
-              style={styles.chevron}
-            />
+            <Feather name="chevron-right" size={16} color={colors.mutedForeground} style={styles.chevron} />
           </Pressable>
 
           {isActive && (
@@ -300,25 +330,12 @@ export default function HomeScreen() {
               onPress={() => router.push("/crop")}
               style={({ pressed }) => [
                 styles.secondaryBtn,
-                {
-                  backgroundColor: colors.card,
-                  borderColor: colors.border,
-                  opacity: pressed ? 0.7 : 1,
-                },
+                { backgroundColor: colors.card, borderColor: colors.border, opacity: pressed ? 0.7 : 1 },
               ]}
             >
               <Feather name="crop" size={18} color={colors.accent} />
-              <Text
-                style={[styles.secondaryBtnText, { color: colors.foreground }]}
-              >
-                Adjust Crop
-              </Text>
-              <Feather
-                name="chevron-right"
-                size={16}
-                color={colors.mutedForeground}
-                style={styles.chevron}
-              />
+              <Text style={[styles.secondaryBtnText, { color: colors.foreground }]}>Adjust Crop</Text>
+              <Feather name="chevron-right" size={16} color={colors.mutedForeground} style={styles.chevron} />
             </Pressable>
           )}
 
@@ -326,110 +343,153 @@ export default function HomeScreen() {
             onPress={() => router.push("/readiness")}
             style={({ pressed }) => [
               styles.secondaryBtn,
-              {
-                backgroundColor: colors.card,
-                borderColor: colors.border,
-                opacity: pressed ? 0.7 : 1,
-              },
+              { backgroundColor: colors.card, borderColor: colors.border, opacity: pressed ? 0.7 : 1 },
             ]}
           >
             <Feather name="cpu" size={18} color={colors.mutedForeground} />
-            <Text
-              style={[styles.secondaryBtnText, { color: colors.foreground }]}
-            >
-              Device Readiness
-            </Text>
-            <Feather
-              name="chevron-right"
-              size={16}
-              color={colors.mutedForeground}
-              style={styles.chevron}
-            />
+            <Text style={[styles.secondaryBtnText, { color: colors.foreground }]}>Device Readiness</Text>
+            <Feather name="chevron-right" size={16} color={colors.mutedForeground} style={styles.chevron} />
           </Pressable>
         </View>
 
-        {/* Native Capture Test */}
-        <Pressable
-          onPress={handleNativeCaptureTest}
-          disabled={mpTestState === "testing"}
-          style={({ pressed }) => [
-            styles.nativeTestBtn,
-            {
-              backgroundColor:
-                mpTestState === "success"
-                  ? `${colors.success}14`
-                  : mpTestState === "failed"
-                    ? `${colors.destructive}14`
-                    : `${colors.accent}10`,
-              borderColor:
-                mpTestState === "success"
-                  ? `${colors.success}44`
-                  : mpTestState === "failed"
-                    ? `${colors.destructive}44`
-                    : `${colors.accent}30`,
-              opacity: mpTestState === "testing" || pressed ? 0.75 : 1,
-            },
-          ]}
-        >
-          {mpTestState === "testing" ? (
-            <ActivityIndicator size="small" color={colors.accent} />
-          ) : (
-            <Feather name="zap" size={15} color={mpTestColor} />
-          )}
-          <Text style={[styles.nativeTestText, { color: mpTestColor }]}>
-            {mpTestLabel}
+        {/* ── Native Handoff Test Panel ────────────────────────────────────── */}
+        <View style={[styles.nativePanel, { backgroundColor: colors.card, borderColor: colors.border }]}>
+          <Text style={[styles.nativePanelTitle, { color: colors.foreground }]}>
+            Native Handoff Test
           </Text>
-        </Pressable>
+          <Text style={[styles.nativePanelSub, { color: colors.mutedForeground }]}>
+            {isExpoGo
+              ? "Requires native APK — build with: npm run android:apk"
+              : "Run in order: permission → start service → stop service"}
+          </Text>
+
+          {/* Button 1: Permission */}
+          <Pressable
+            onPress={handleTestPermission}
+            disabled={nt.permission === "busy"}
+            style={({ pressed }) => [
+              styles.nativeBtn,
+              {
+                backgroundColor: testBg(nt.permission),
+                borderColor: testBorder(nt.permission),
+                opacity: nt.permission === "busy" || pressed ? 0.7 : 1,
+              },
+            ]}
+          >
+            {nt.permission === "busy"
+              ? <ActivityIndicator size="small" color={colors.accent} />
+              : <Feather name="shield" size={15} color={testColor(nt.permission)} />}
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.nativeBtnLabel, { color: testColor(nt.permission) }]}>
+                Test MediaProjection Permission
+              </Text>
+              {nt.permissionMsg ? (
+                <Text style={[styles.nativeBtnSub, { color: testColor(nt.permission) }]}>
+                  {nt.permissionMsg}
+                </Text>
+              ) : (
+                <Text style={[styles.nativeBtnSub, { color: colors.mutedForeground }]}>
+                  Opens Android "Start recording?" dialog
+                </Text>
+              )}
+            </View>
+          </Pressable>
+
+          {/* Button 2: Start service */}
+          <Pressable
+            onPress={handleStartService}
+            disabled={nt.service === "busy" || (!nt.permissionGranted && !isExpoGo)}
+            style={({ pressed }) => [
+              styles.nativeBtn,
+              {
+                backgroundColor: testBg(nt.service),
+                borderColor: testBorder(nt.service),
+                opacity:
+                  nt.service === "busy" ||
+                  (!nt.permissionGranted && !isExpoGo) ||
+                  pressed
+                    ? 0.45
+                    : 1,
+              },
+            ]}
+          >
+            {nt.service === "busy"
+              ? <ActivityIndicator size="small" color={colors.accent} />
+              : <Feather name="play-circle" size={15} color={testColor(nt.service)} />}
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.nativeBtnLabel, { color: testColor(nt.service) }]}>
+                Test Foreground Capture Service
+              </Text>
+              {nt.serviceMsg ? (
+                <Text style={[styles.nativeBtnSub, { color: testColor(nt.service) }]}>
+                  {nt.serviceMsg}
+                </Text>
+              ) : (
+                <Text style={[styles.nativeBtnSub, { color: colors.mutedForeground }]}>
+                  {nt.permissionGranted
+                    ? "Starts ScreenCaptureService — check notification bar"
+                    : "Grant permission first (button above)"}
+                </Text>
+              )}
+            </View>
+          </Pressable>
+
+          {/* Button 3: Stop service */}
+          <Pressable
+            onPress={handleStopService}
+            disabled={nt.stop === "busy" || (!nt.serviceRunning && !isExpoGo)}
+            style={({ pressed }) => [
+              styles.nativeBtn,
+              {
+                backgroundColor: testBg(nt.stop),
+                borderColor: testBorder(nt.stop),
+                opacity:
+                  nt.stop === "busy" ||
+                  (!nt.serviceRunning && !isExpoGo) ||
+                  pressed
+                    ? 0.45
+                    : 1,
+              },
+            ]}
+          >
+            {nt.stop === "busy"
+              ? <ActivityIndicator size="small" color={colors.accent} />
+              : <Feather name="stop-circle" size={15} color={testColor(nt.stop)} />}
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.nativeBtnLabel, { color: testColor(nt.stop) }]}>
+                Stop Capture Service
+              </Text>
+              {nt.stopMsg ? (
+                <Text style={[styles.nativeBtnSub, { color: testColor(nt.stop) }]}>
+                  {nt.stopMsg}
+                </Text>
+              ) : (
+                <Text style={[styles.nativeBtnSub, { color: colors.mutedForeground }]}>
+                  {nt.serviceRunning
+                    ? "Stops service, clears token — notification disappears"
+                    : "Start service first (button above)"}
+                </Text>
+              )}
+            </View>
+          </Pressable>
+        </View>
 
         {/* How it works */}
         {!isActive && (
-          <View
-            style={[
-              styles.howItWorks,
-              { backgroundColor: colors.card, borderColor: colors.border },
-            ]}
-          >
-            <Text
-              style={[styles.howTitle, { color: colors.foreground }]}
-            >
-              How it works
-            </Text>
+          <View style={[styles.howItWorks, { backgroundColor: colors.card, borderColor: colors.border }]}>
+            <Text style={[styles.howTitle, { color: colors.foreground }]}>HOW IT WORKS</Text>
             {[
-              {
-                icon: "radio" as const,
-                text: "Tap Start Capture and grant screen recording permission",
-              },
-              {
-                icon: "crop" as const,
-                text: "Drag the crop box over the text you want to capture",
-              },
-              {
-                icon: "zap" as const,
-                text: "OCR runs every 1-2 seconds as you scroll",
-              },
-              {
-                icon: "layers" as const,
-                text: "Duplicate text is automatically skipped",
-              },
-              {
-                icon: "share-2" as const,
-                text: "Pause, edit, and export the transcript",
-              },
+              { icon: "radio" as const, text: "Tap Start Capture and grant screen recording permission" },
+              { icon: "crop" as const, text: "Drag the crop box over the text you want to capture" },
+              { icon: "zap" as const, text: "OCR runs every 1-2 seconds as you scroll" },
+              { icon: "layers" as const, text: "Duplicate text is automatically skipped" },
+              { icon: "share-2" as const, text: "Pause, edit, and export the transcript" },
             ].map((step, i) => (
               <View key={i} style={styles.howStep}>
-                <View
-                  style={[
-                    styles.howIcon,
-                    { backgroundColor: `${colors.primary}18` },
-                  ]}
-                >
+                <View style={[styles.howIcon, { backgroundColor: `${colors.primary}18` }]}>
                   <Feather name={step.icon} size={14} color={colors.primary} />
                 </View>
-                <Text
-                  style={[styles.howText, { color: colors.mutedForeground }]}
-                >
-                  {step.text}
-                </Text>
+                <Text style={[styles.howText, { color: colors.mutedForeground }]}>{step.text}</Text>
               </View>
             ))}
           </View>
@@ -449,182 +509,41 @@ export default function HomeScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
-  scroll: {
-    paddingHorizontal: 20,
-    gap: 16,
-    flexGrow: 1,
-  },
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-  },
-  appName: {
-    fontSize: 28,
-    fontFamily: "Inter_700Bold",
-    letterSpacing: -0.5,
-  },
-  tagline: {
-    fontSize: 13,
-    fontFamily: "Inter_400Regular",
-    marginTop: 2,
-  },
-  settingsBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  modeBanner: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 9,
-    borderRadius: 10,
-    borderWidth: 1,
-  },
-  modeBannerText: {
-    flex: 1,
-    fontSize: 12,
-    fontFamily: "Inter_500Medium",
-    lineHeight: 16,
-  },
-  statusRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    flexWrap: "wrap",
-  },
-  statsRow: {
-    flexDirection: "row",
-    gap: 10,
-  },
-  statCard: {
-    flex: 1,
-    padding: 14,
-    borderRadius: 12,
-    borderWidth: 1,
-    alignItems: "center",
-    gap: 4,
-  },
-  statValue: {
-    fontSize: 24,
-    fontFamily: "Inter_700Bold",
-  },
-  statLabel: {
-    fontSize: 11,
-    fontFamily: "Inter_400Regular",
-  },
-  startButton: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 10,
-    paddingVertical: 18,
-    borderRadius: 16,
-  },
-  startButtonText: {
-    fontSize: 17,
-    fontFamily: "Inter_600SemiBold",
-  },
-  stopButton: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 10,
-    paddingVertical: 16,
-    borderRadius: 16,
-    borderWidth: 1.5,
-  },
-  stopButtonText: {
-    fontSize: 17,
-    fontFamily: "Inter_600SemiBold",
-  },
+  scroll: { paddingHorizontal: 20, gap: 16, flexGrow: 1 },
+  header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  appName: { fontSize: 28, fontFamily: "Inter_700Bold", letterSpacing: -0.5 },
+  tagline: { fontSize: 13, fontFamily: "Inter_400Regular", marginTop: 2 },
+  settingsBtn: { width: 38, height: 38, borderRadius: 10, alignItems: "center", justifyContent: "center" },
+  modeBanner: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, paddingVertical: 9, borderRadius: 10, borderWidth: 1 },
+  modeBannerText: { flex: 1, fontSize: 12, fontFamily: "Inter_500Medium", lineHeight: 16 },
+  statusRow: { flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" },
+  statsRow: { flexDirection: "row", gap: 10 },
+  statCard: { flex: 1, padding: 14, borderRadius: 12, borderWidth: 1, alignItems: "center", gap: 4 },
+  statValue: { fontSize: 24, fontFamily: "Inter_700Bold" },
+  statLabel: { fontSize: 11, fontFamily: "Inter_400Regular" },
+  startButton: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10, paddingVertical: 18, borderRadius: 16 },
+  startButtonText: { fontSize: 17, fontFamily: "Inter_600SemiBold" },
+  stopButton: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10, paddingVertical: 16, borderRadius: 16, borderWidth: 1.5 },
+  stopButtonText: { fontSize: 17, fontFamily: "Inter_600SemiBold" },
   secondaryActions: { gap: 8 },
-  secondaryBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    padding: 14,
-    borderRadius: 12,
-    borderWidth: 1,
-  },
-  secondaryBtnText: {
-    flex: 1,
-    fontSize: 15,
-    fontFamily: "Inter_500Medium",
-  },
+  secondaryBtn: { flexDirection: "row", alignItems: "center", gap: 10, padding: 14, borderRadius: 12, borderWidth: 1 },
+  secondaryBtnText: { flex: 1, fontSize: 15, fontFamily: "Inter_500Medium" },
   chevron: { marginLeft: "auto" },
-  badge: {
-    minWidth: 20,
-    height: 20,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center",
-    paddingHorizontal: 5,
-  },
-  badgeText: {
-    color: "#fff",
-    fontSize: 10,
-    fontFamily: "Inter_700Bold",
-  },
-  nativeTestBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 8,
-    paddingVertical: 13,
-    borderRadius: 12,
-    borderWidth: 1,
-  },
-  nativeTestText: {
-    fontSize: 13,
-    fontFamily: "Inter_500Medium",
-  },
-  howItWorks: {
-    padding: 16,
-    borderRadius: 14,
-    borderWidth: 1,
-    gap: 12,
-  },
-  howTitle: {
-    fontSize: 13,
-    fontFamily: "Inter_600SemiBold",
-    letterSpacing: 0.3,
-    textTransform: "uppercase",
-    marginBottom: 2,
-  },
-  howStep: {
-    flexDirection: "row",
-    alignItems: "flex-start",
-    gap: 10,
-  },
-  howIcon: {
-    width: 26,
-    height: 26,
-    borderRadius: 7,
-    alignItems: "center",
-    justifyContent: "center",
-    marginTop: 1,
-  },
-  howText: {
-    flex: 1,
-    fontSize: 13,
-    fontFamily: "Inter_400Regular",
-    lineHeight: 18,
-  },
-  privacyNote: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    paddingHorizontal: 4,
-  },
-  privacyText: {
-    fontSize: 11,
-    fontFamily: "Inter_400Regular",
-    flex: 1,
-    lineHeight: 16,
-  },
+  badge: { minWidth: 20, height: 20, borderRadius: 10, alignItems: "center", justifyContent: "center", paddingHorizontal: 5 },
+  badgeText: { color: "#fff", fontSize: 10, fontFamily: "Inter_700Bold" },
+  // Native test panel
+  nativePanel: { borderRadius: 14, borderWidth: 1, padding: 14, gap: 10 },
+  nativePanelTitle: { fontSize: 13, fontFamily: "Inter_600SemiBold", letterSpacing: 0.3, textTransform: "uppercase" },
+  nativePanelSub: { fontSize: 12, fontFamily: "Inter_400Regular", lineHeight: 17, marginBottom: 2 },
+  nativeBtn: { flexDirection: "row", alignItems: "flex-start", gap: 10, padding: 12, borderRadius: 10, borderWidth: 1 },
+  nativeBtnLabel: { fontSize: 13, fontFamily: "Inter_600SemiBold", marginBottom: 2 },
+  nativeBtnSub: { fontSize: 11, fontFamily: "Inter_400Regular", lineHeight: 16 },
+  // How it works
+  howItWorks: { padding: 16, borderRadius: 14, borderWidth: 1, gap: 12 },
+  howTitle: { fontSize: 11, fontFamily: "Inter_600SemiBold", letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 2 },
+  howStep: { flexDirection: "row", alignItems: "flex-start", gap: 10 },
+  howIcon: { width: 26, height: 26, borderRadius: 7, alignItems: "center", justifyContent: "center", marginTop: 1 },
+  howText: { flex: 1, fontSize: 13, fontFamily: "Inter_400Regular", lineHeight: 18 },
+  privacyNote: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 4 },
+  privacyText: { fontSize: 11, fontFamily: "Inter_400Regular", flex: 1, lineHeight: 16 },
 });

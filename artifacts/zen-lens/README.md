@@ -79,18 +79,28 @@ adb install path/to/zen-lens.apk
 
 Or open the EAS build URL on your Android device and tap **Install**.
 
-### Verify native modules on device
+### Native APK test order
 
-After installing:
-1. Open ZenLens on your device
-2. Tap **Device Readiness** on the home screen
-3. All 4 rows must show ✓:
-   - MediaProjection Capture (`NativeModules.ZenLensCapture`)
-   - ML Kit OCR (`NativeModules.ZenLensOCR`)
-   - System Overlay (`NativeModules.ZenLensOverlay`)
-   - File Export
-4. Tap **Native Capture Test** — Android will show the MediaProjection system dialog
-5. Tap "Start now" → status changes to "Native capture granted ✓"
+After installing on a **physical Android device**:
+
+1. Open ZenLens
+2. Go to **Device Readiness**
+3. Confirm **ZenLensCapture module** row shows ✓
+4. Confirm **MediaProjection permission wiring** row shows ✓ (ActivityEventListener registered)
+5. Confirm **Foreground capture service wiring** row shows ✓ (all three methods present)
+6. Tap **Test MediaProjection Permission**
+   — Android "Start recording?" dialog appears
+   — Tap **Start now** → status shows "Granted ✓ — token cached"
+7. Tap **Test Foreground Capture Service**
+   — Service starts → persistent **ZenLens notification** appears in the status bar
+8. Tap **Stop Capture Service**
+   — Notification disappears → token cleared → "Service stopped ✓"
+9. If all three buttons show green: **the foreground service handoff is proven**
+10. Next build step: **single-frame capture** via VirtualDisplay — not OCR yet
+
+> **Android 14+ note:** The MediaProjection token is one-session-use.
+> After stop, a fresh **Test MediaProjection Permission** is required before
+> starting the service again. This is by Android design, not a bug.
 
 ---
 

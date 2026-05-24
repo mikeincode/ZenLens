@@ -79,13 +79,11 @@ function getSimulatedOcrResult(minConfidence: number): OcrResult {
   const page = SIMULATED_PAGES[simulatedPageIndex % SIMULATED_PAGES.length];
   const lines = page.split("\n").filter((l) => l.trim().length > 0);
 
-  // Return a sliding window of lines (simulate scrolling)
   const windowSize = 4;
   const start = simulatedLineOffset;
   const end = Math.min(start + windowSize, lines.length);
   const visibleLines = lines.slice(start, end);
 
-  // Advance for next call
   simulatedLineOffset += 2;
   if (simulatedLineOffset >= lines.length - 1) {
     simulatedLineOffset = 0;
@@ -105,7 +103,8 @@ function getSimulatedOcrResult(minConfidence: number): OcrResult {
   };
 }
 
-// Native module bridge (only available in custom dev build with ML Kit)
+// ─── Native module accessors ──────────────────────────────────────────────────
+
 function getNativeOcrModule(): any {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -126,6 +125,8 @@ function getNativeCaptureModule(): any {
   }
 }
 
+// ─── Mode detection ───────────────────────────────────────────────────────────
+
 export function isExpoGo(): boolean {
   return (
     Constants.appOwnership === "expo" ||
@@ -135,31 +136,48 @@ export function isExpoGo(): boolean {
 
 export function isNativeAvailable(): boolean {
   if (Platform.OS !== "android") return false;
-  const mod = getNativeCaptureModule();
-  return mod !== null;
+  return getNativeCaptureModule() !== null;
 }
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface PermissionWiringStatus {
-  /** Module registered and ActivityEventListener wired (always true if native build) */
   activityListenerRegistered: boolean;
-  /** MEDIA_PROJECTION_REQUEST constant from the module */
   requestCode: number;
-  /** Whether MediaProjection permission is currently held */
   permissionGranted: boolean;
+  serviceMethodsPresent: boolean;
 }
 
+export interface PermissionResult {
+  granted: boolean;
+  permissionCached: boolean;
+  reason?: string;
+}
+
+export interface ServiceStartResult {
+  started: boolean;
+  reason?: string;
+}
+
+export interface ServiceStopResult {
+  stopped: boolean;
+}
+
+export interface CaptureServiceStatus {
+  permissionGranted: boolean;
+  serviceRunning: boolean;
+  hasProjectionToken: boolean;
+}
+
+// ─── Wiring check ─────────────────────────────────────────────────────────────
+
 /**
- * Calls ScreenCaptureModule.checkWiring() to verify the full MediaProjection
- * permission flow is wired — ActivityEventListener registered, request code
- * constant present, and whether permission is currently held.
- *
- * Returns null in Expo Go (module not available).
+ * Calls checkWiring() on ZenLensCapture to verify ActivityEventListener
+ * registration and service method presence. Returns null in Expo Go.
  */
 export async function checkPermissionWiring(): Promise<PermissionWiringStatus | null> {
   const mod = getNativeCaptureModule();
-  if (!mod) return null;
-  // checkWiring is only present in the updated module
-  if (typeof mod.checkWiring !== "function") return null;
+  if (!mod || typeof mod.checkWiring !== "function") return null;
   try {
     return await mod.checkWiring();
   } catch {
@@ -167,19 +185,84 @@ export async function checkPermissionWiring(): Promise<PermissionWiringStatus | 
   }
 }
 
+// ─── Permission ───────────────────────────────────────────────────────────────
+
+/**
+ * Opens the Android "Start recording?" system dialog.
+ * Returns { granted, permissionCached, reason? } in native build.
+ * Returns null in Expo Go (module not available).
+ */
+export async function requestNativeMediaProjectionPermission(): Promise<PermissionResult | null> {
+  const mod = getNativeCaptureModule();
+  if (!mod || typeof mod.requestPermission !== "function") return null;
+  try {
+    return await mod.requestPermission();
+  } catch (e: any) {
+    return { granted: false, permissionCached: false, reason: e?.message ?? "Unknown error" };
+  }
+}
+
+/**
+ * Simulation-aware permission request for CaptureContext.
+ * Native build: real MediaProjection dialog.
+ * Expo Go / simulation: always returns true after short delay.
+ */
 export async function requestMediaProjectionPermission(): Promise<boolean> {
   if (isNativeAvailable()) {
-    try {
-      const mod = getNativeCaptureModule();
-      return await mod.requestPermission();
-    } catch {
-      return false;
-    }
+    const result = await requestNativeMediaProjectionPermission();
+    return result?.granted ?? false;
   }
-  // Simulation: always grant in dev
   await new Promise((r) => setTimeout(r, 800));
   return true;
 }
+
+// ─── Foreground service ───────────────────────────────────────────────────────
+
+/**
+ * Starts ScreenCaptureService with the stored MediaProjection grant.
+ * Returns { started, reason? } in native build.
+ * Returns null in Expo Go.
+ */
+export async function startNativeCaptureService(): Promise<ServiceStartResult | null> {
+  const mod = getNativeCaptureModule();
+  if (!mod || typeof mod.startCaptureService !== "function") return null;
+  try {
+    return await mod.startCaptureService();
+  } catch (e: any) {
+    return { started: false, reason: e?.message ?? "Unknown error" };
+  }
+}
+
+/**
+ * Stops ScreenCaptureService and clears the one-session MediaProjection token.
+ * Returns { stopped } in native build. Returns null in Expo Go.
+ */
+export async function stopNativeCaptureService(): Promise<ServiceStopResult | null> {
+  const mod = getNativeCaptureModule();
+  if (!mod || typeof mod.stopCaptureService !== "function") return null;
+  try {
+    return await mod.stopCaptureService();
+  } catch {
+    return { stopped: false };
+  }
+}
+
+/**
+ * Returns live status without side effects.
+ * { permissionGranted, serviceRunning, hasProjectionToken }
+ * Returns null in Expo Go.
+ */
+export async function getNativeCaptureServiceStatus(): Promise<CaptureServiceStatus | null> {
+  const mod = getNativeCaptureModule();
+  if (!mod || typeof mod.getCaptureServiceStatus !== "function") return null;
+  try {
+    return await mod.getCaptureServiceStatus();
+  } catch {
+    return null;
+  }
+}
+
+// ─── Overlay ──────────────────────────────────────────────────────────────────
 
 export async function requestOverlayPermission(): Promise<boolean> {
   if (isNativeAvailable()) {
@@ -194,36 +277,24 @@ export async function requestOverlayPermission(): Promise<boolean> {
   return true;
 }
 
-export async function startForegroundCapture(cropRect: {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
+// ─── Legacy wrappers (used by CaptureContext simulation path) ─────────────────
+
+export async function startForegroundCapture(_cropRect: {
+  x: number; y: number; width: number; height: number;
 }): Promise<boolean> {
-  if (isNativeAvailable()) {
-    try {
-      const mod = getNativeCaptureModule();
-      return await mod.startCapture(
-        cropRect.x,
-        cropRect.y,
-        cropRect.width,
-        cropRect.height
-      );
-    } catch {
-      return false;
-    }
-  }
+  // Native frame capture not yet implemented — use startNativeCaptureService() instead.
+  // Simulation mode always returns true.
+  if (isNativeAvailable()) return false;
   return true;
 }
 
 export async function stopForegroundCapture(): Promise<void> {
   if (isNativeAvailable()) {
-    try {
-      const mod = getNativeCaptureModule();
-      await mod.stopCapture();
-    } catch {}
+    await stopNativeCaptureService();
   }
 }
+
+// ─── OCR ─────────────────────────────────────────────────────────────────────
 
 export async function recognizeTextFromCrop(
   _cropRect: { x: number; y: number; width: number; height: number },
@@ -233,19 +304,13 @@ export async function recognizeTextFromCrop(
     try {
       const captureModule = getNativeCaptureModule();
       const ocrModule = getNativeOcrModule();
-      // Capture the crop frame
       const base64Frame = await captureModule.captureFrame();
       if (!base64Frame) return null;
-      // Run OCR on the frame
       const result = await ocrModule.recognizeText(base64Frame);
-      if (!result || !result.text) return null;
+      if (!result?.text) return null;
       const confidence = result.confidence ?? 0.8;
       if (confidence < minConfidence) return null;
-      return {
-        text: result.text,
-        confidence,
-        blocks: result.blocks ?? [],
-      };
+      return { text: result.text, confidence, blocks: result.blocks ?? [] };
     } catch {
       return null;
     }

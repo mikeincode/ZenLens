@@ -2,7 +2,7 @@ import { Feather } from "@expo/vector-icons";
 import Constants from "expo-constants";
 import * as Haptics from "expo-haptics";
 import { router } from "expo-router";
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   NativeModules,
@@ -14,233 +14,338 @@ import {
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { checkPermissionWiring, type PermissionWiringStatus } from "@/utils/ocr";
+import {
+  checkPermissionWiring,
+  getNativeCaptureServiceStatus,
+  requestNativeMediaProjectionPermission,
+  startNativeCaptureService,
+  stopNativeCaptureService,
+  type PermissionWiringStatus,
+  type CaptureServiceStatus,
+} from "@/utils/ocr";
 import { useColors } from "@/hooks/useColors";
 
 const isExpoGo =
   Constants.appOwnership === "expo" ||
   Constants.executionEnvironment === "storeClient";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+type RowStatus = "checking" | "ok" | "warn" | "err";
 
-type Status = "checking" | "available" | "unavailable" | "partial";
-
-interface CheckRow {
-  id: string;
-  title: string;
-  description: string;
-  icon: string;
-  /** Static module key to check in NativeModules (synchronous) */
-  nativeKey?: string;
-  /** Always available in native build (not in Expo Go) */
-  alwaysInNative?: boolean;
+interface RowState {
+  status: RowStatus;
+  detail: string;
 }
 
-// ─── Static module checks (synchronous) ──────────────────────────────────────
+interface ReadinessState {
+  captureModule: RowState;
+  wiringListener: RowState;
+  permissionGranted: RowState;
+  serviceWiring: RowState;
+  serviceRunning: RowState;
+  overlayModule: RowState;
+  ocrModule: RowState;
+  fileExport: RowState;
+}
 
-const MODULE_CHECKS: CheckRow[] = [
-  {
-    id: "capture_module",
-    title: "ZenLensCapture Module",
-    description:
-      "ScreenCaptureModule registered — NativeModules.ZenLensCapture exists.",
-    nativeKey: "ZenLensCapture",
-    icon: "radio",
-  },
-  {
-    id: "ocr",
-    title: "ML Kit OCR Module",
-    description:
-      "MLKitOCRModule registered — NativeModules.ZenLensOCR exists.",
-    nativeKey: "ZenLensOCR",
-    icon: "type",
-  },
-  {
-    id: "overlay",
-    title: "System Overlay Module",
-    description:
-      "OverlayModule registered — NativeModules.ZenLensOverlay exists.",
-    nativeKey: "ZenLensOverlay",
-    icon: "layers",
-  },
-  {
-    id: "export",
-    title: "File Export",
-    description:
-      "expo-file-system + expo-sharing available. Works in any native build.",
-    alwaysInNative: true,
-    icon: "share-2",
-  },
-];
+const CHECKING: RowState = { status: "checking", detail: "" };
+const init: ReadinessState = {
+  captureModule: CHECKING,
+  wiringListener: CHECKING,
+  permissionGranted: CHECKING,
+  serviceWiring: CHECKING,
+  serviceRunning: CHECKING,
+  overlayModule: CHECKING,
+  ocrModule: CHECKING,
+  fileExport: CHECKING,
+};
 
-// ─── Helper components ────────────────────────────────────────────────────────
-
-function StatusIcon({
-  status,
-  colors,
-}: {
-  status: Status;
-  colors: ReturnType<typeof import("@/hooks/useColors").useColors>;
-}) {
-  if (status === "checking")
-    return <ActivityIndicator size="small" color={colors.mutedForeground} />;
-  if (status === "available")
-    return <Feather name="check-circle" size={20} color={colors.success} />;
-  if (status === "partial")
-    return <Feather name="alert-circle" size={20} color={colors.warning} />;
+function RowIcon({ status, colors }: { status: RowStatus; colors: any }) {
+  if (status === "checking") return <ActivityIndicator size="small" color={colors.mutedForeground} />;
+  if (status === "ok") return <Feather name="check-circle" size={20} color={colors.success} />;
+  if (status === "warn") return <Feather name="alert-circle" size={20} color={colors.warning} />;
   return <Feather name="x-circle" size={20} color={colors.destructive} />;
 }
 
-// ─── Screen ───────────────────────────────────────────────────────────────────
+function statusBorder(status: RowStatus, colors: any) {
+  if (status === "warn") return `${colors.warning}55`;
+  if (status === "err") return `${colors.destructive}22`;
+  return colors.border;
+}
 
 export default function ReadinessScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
+  const [rows, setRows] = useState<ReadinessState>(init);
+  const [mpState, setMpState] = useState<"idle" | "busy" | "ok" | "err">("idle");
+  const [mpMsg, setMpMsg] = useState("");
+  const [svcState, setSvcState] = useState<"idle" | "busy" | "ok" | "err">("idle");
+  const [svcMsg, setSvcMsg] = useState("");
+  const [stopState, setStopState] = useState<"idle" | "busy" | "ok" | "err">("idle");
+  const [stopMsg, setStopMsg] = useState("");
+  const [permGranted, setPermGranted] = useState(false);
+  const [svcRunning, setSvcRunning] = useState(false);
 
-  // Static module statuses (synchronous)
-  const [moduleStatuses, setModuleStatuses] = useState<Record<string, Status>>(
-    {}
-  );
-
-  // Async wiring check result
-  const [wiringStatus, setWiringStatus] = useState<Status>("checking");
-  const [wiringDetail, setWiringDetail] = useState<PermissionWiringStatus | null>(null);
-  const [wiringMessage, setWiringMessage] = useState("");
-
-  // Native Capture Test
-  const [mpTestState, setMpTestState] = useState<
-    "idle" | "testing" | "success" | "failed"
-  >("idle");
-
-  // ─── Initial checks ──────────────────────────────────────────────────────
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
-    // Synchronous module presence checks
-    const result: Record<string, Status> = {};
-    for (const check of MODULE_CHECKS) {
-      if (check.alwaysInNative) {
-        result[check.id] = isExpoGo ? "unavailable" : "available";
-      } else if (check.nativeKey) {
-        const mod = (NativeModules as Record<string, unknown>)[check.nativeKey];
-        result[check.id] = mod != null ? "available" : "unavailable";
-      }
-    }
-    setModuleStatuses(result);
-
-    // Async permission wiring check
-    runWiringCheck();
+    runChecks();
+    // Poll service status every 3s while screen is open
+    pollingRef.current = setInterval(pollServiceStatus, 3000);
+    return () => {
+      if (pollingRef.current) clearInterval(pollingRef.current);
+    };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function runWiringCheck() {
-    setWiringStatus("checking");
-    const captureModule = (NativeModules as Record<string, unknown>)["ZenLensCapture"];
+  async function pollServiceStatus() {
+    const status = await getNativeCaptureServiceStatus();
+    if (!status) return;
+    setSvcRunning(status.serviceRunning);
+    setPermGranted(status.permissionGranted);
+    setRows((prev) => ({
+      ...prev,
+      permissionGranted: status.permissionGranted
+        ? { status: "ok", detail: "MediaProjection token cached — ready to start service." }
+        : { status: "err", detail: "No permission cached. Tap 'Test MediaProjection Permission' below." },
+      serviceRunning: status.serviceRunning
+        ? { status: "ok", detail: "ScreenCaptureService is running. Check Android notification bar." }
+        : { status: "err", detail: "Service not running. Tap 'Test Foreground Capture Service' below." },
+    }));
+  }
 
+  async function runChecks() {
+    setRows(init);
+
+    // ── 1. ZenLensCapture module exists ───────────────────────────────────────
+    const captureModule = (NativeModules as any).ZenLensCapture;
     if (!captureModule) {
-      // Module not present at all
-      setWiringStatus("unavailable");
-      setWiringMessage(
-        isExpoGo
-          ? "Not available in Expo Go — requires native build."
-          : "ZenLensCapture module missing — run android:sync-native."
-      );
-      return;
-    }
-
-    const mod = captureModule as Record<string, unknown>;
-    if (typeof mod["checkWiring"] !== "function") {
-      // Module exists but is an old version without checkWiring
-      setWiringStatus("partial");
-      setWiringMessage(
-        "Native module found, but MediaProjection permission wiring is incomplete. " +
-        "Rebuild APK with the updated ScreenCaptureModule.kt."
-      );
-      return;
-    }
-
-    const wiring = await checkPermissionWiring();
-    if (!wiring) {
-      setWiringStatus("partial");
-      setWiringMessage(
-        "checkWiring() returned null — module may be outdated. Rebuild APK."
-      );
-      return;
-    }
-
-    setWiringDetail(wiring);
-
-    if (wiring.activityListenerRegistered) {
-      setWiringStatus("available");
-      setWiringMessage(
-        wiring.permissionGranted
-          ? "Wired ✓ — permission already granted for this session."
-          : `Wired ✓ — ActivityEventListener registered, request code ${wiring.requestCode}.`
-      );
+      const reason = isExpoGo
+        ? "Not available in Expo Go — build native APK."
+        : "ZenLensCapture module missing — run android:sync-native then rebuild.";
+      setRows((p) => ({
+        ...p,
+        captureModule: { status: "err", detail: reason },
+        wiringListener: { status: "err", detail: "Cannot check wiring without module." },
+        permissionGranted: { status: "err", detail: "Module missing." },
+        serviceWiring: { status: "err", detail: "Module missing." },
+        serviceRunning: { status: "err", detail: "Module missing." },
+      }));
     } else {
-      setWiringStatus("partial");
-      setWiringMessage(
-        "Module loaded but ActivityEventListener not registered. Rebuild APK."
-      );
+      setRows((p) => ({ ...p, captureModule: { status: "ok", detail: "NativeModules.ZenLensCapture exists." } }));
+
+      // ── 2. ActivityEventListener wiring ────────────────────────────────────
+      const wiring: PermissionWiringStatus | null = await checkPermissionWiring();
+      if (!wiring) {
+        setRows((p) => ({
+          ...p,
+          wiringListener: {
+            status: "warn",
+            detail: "Module found but checkWiring() missing — old APK. Rebuild with updated ScreenCaptureModule.kt.",
+          },
+        }));
+      } else if (!wiring.activityListenerRegistered) {
+        setRows((p) => ({
+          ...p,
+          wiringListener: {
+            status: "warn",
+            detail: "Module found, but ActivityEventListener not registered. Rebuild APK.",
+          },
+        }));
+      } else {
+        setRows((p) => ({
+          ...p,
+          wiringListener: {
+            status: "ok",
+            detail: `ActivityEventListener registered. requestCode=${wiring.requestCode}.`,
+          },
+        }));
+      }
+
+      // ── 3. Foreground service wiring ───────────────────────────────────────
+      const hasServiceMethods =
+        typeof captureModule.startCaptureService === "function" &&
+        typeof captureModule.stopCaptureService === "function" &&
+        typeof captureModule.getCaptureServiceStatus === "function";
+
+      if (!hasServiceMethods) {
+        setRows((p) => ({
+          ...p,
+          serviceWiring: {
+            status: "warn",
+            detail:
+              "Native module found, but foreground service handoff is incomplete. " +
+              "Rebuild APK with updated ScreenCaptureModule.kt (startCaptureService / stopCaptureService / getCaptureServiceStatus missing).",
+          },
+        }));
+      } else {
+        setRows((p) => ({
+          ...p,
+          serviceWiring: {
+            status: "ok",
+            detail: "startCaptureService / stopCaptureService / getCaptureServiceStatus all present.",
+          },
+        }));
+      }
+
+      // ── 4. Live permission + service status ────────────────────────────────
+      const liveStatus: CaptureServiceStatus | null = await getNativeCaptureServiceStatus();
+      if (liveStatus) {
+        setPermGranted(liveStatus.permissionGranted);
+        setSvcRunning(liveStatus.serviceRunning);
+        setRows((p) => ({
+          ...p,
+          permissionGranted: liveStatus.permissionGranted
+            ? { status: "ok", detail: "MediaProjection token cached — ready to start service." }
+            : { status: "err", detail: "No permission cached. Tap 'Test MediaProjection Permission' below." },
+          serviceRunning: liveStatus.serviceRunning
+            ? { status: "ok", detail: "ScreenCaptureService is running. Check Android notification bar." }
+            : { status: "err", detail: "Service not running. Tap 'Test Foreground Capture Service' below." },
+        }));
+      } else {
+        setRows((p) => ({
+          ...p,
+          permissionGranted: { status: "err", detail: "getCaptureServiceStatus() unavailable." },
+          serviceRunning: { status: "err", detail: "getCaptureServiceStatus() unavailable." },
+        }));
+      }
     }
+
+    // ── 5. ZenLensOverlay module ───────────────────────────────────────────────
+    const overlayModule = (NativeModules as any).ZenLensOverlay;
+    setRows((p) => ({
+      ...p,
+      overlayModule: overlayModule
+        ? { status: "ok", detail: "NativeModules.ZenLensOverlay exists." }
+        : { status: "err", detail: isExpoGo ? "Not available in Expo Go." : "Module missing — sync native files." },
+    }));
+
+    // ── 6. ML Kit OCR module ──────────────────────────────────────────────────
+    const ocrModule = (NativeModules as any).ZenLensOCR;
+    setRows((p) => ({
+      ...p,
+      ocrModule: ocrModule
+        ? { status: "ok", detail: "NativeModules.ZenLensOCR exists." }
+        : { status: "err", detail: isExpoGo ? "Not available in Expo Go." : "Module missing — add ML Kit dependency." },
+    }));
+
+    // ── 7. File export (always available in native build) ─────────────────────
+    setRows((p) => ({
+      ...p,
+      fileExport: isExpoGo
+        ? { status: "warn", detail: "Limited in Expo Go — full export available in native build." }
+        : { status: "ok", detail: "expo-file-system + expo-sharing available." },
+    }));
   }
 
-  // ─── Native Capture Test ─────────────────────────────────────────────────
+  // ── Test handlers ──────────────────────────────────────────────────────────
 
-  async function handleTestMediaProjection() {
+  async function handleTestPermission() {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-
-    if (isExpoGo) {
-      setMpTestState("failed");
-      return;
-    }
-
-    const mod = (NativeModules as Record<string, unknown>)["ZenLensCapture"] as
-      | Record<string, unknown>
-      | undefined;
-
-    if (!mod || typeof mod["requestPermission"] !== "function") {
-      setMpTestState("failed");
-      return;
-    }
-
-    setMpTestState("testing");
-    try {
-      const granted = await (mod["requestPermission"] as () => Promise<boolean>)();
-      setMpTestState(granted ? "success" : "failed");
-      // Refresh wiring status to show permissionGranted = true
-      if (granted) runWiringCheck();
-    } catch {
-      setMpTestState("failed");
+    if (isExpoGo) { setMpMsg("Not available in Expo Go."); setMpState("err"); return; }
+    setMpState("busy"); setMpMsg("");
+    const result = await requestNativeMediaProjectionPermission();
+    if (!result) { setMpState("err"); setMpMsg("ZenLensCapture module not found."); return; }
+    if (result.granted) {
+      setMpState("ok");
+      setMpMsg("Permission granted ✓ — token cached. Start the service next.");
+      setPermGranted(true);
+      await pollServiceStatus();
+    } else {
+      setMpState("err");
+      setMpMsg(result.reason ?? "Permission denied.");
     }
   }
 
-  // ─── Derived display values ───────────────────────────────────────────────
+  async function handleStartService() {
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setSvcState("busy"); setSvcMsg("");
+    const result = await startNativeCaptureService();
+    if (!result) { setSvcState("err"); setSvcMsg("startCaptureService() not found — rebuild APK."); return; }
+    if (result.started) {
+      setSvcState("ok");
+      setSvcMsg("Service started ✓ — check the Android notification bar.");
+      setSvcRunning(true);
+      await pollServiceStatus();
+    } else {
+      setSvcState("err");
+      setSvcMsg(result.reason ?? "Service failed to start.");
+    }
+  }
 
-  const mpTestColor =
-    mpTestState === "success"
-      ? colors.success
-      : mpTestState === "failed"
-        ? colors.destructive
-        : colors.accent;
+  async function handleStopService() {
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setStopState("busy"); setStopMsg("");
+    const result = await stopNativeCaptureService();
+    if (!result) { setStopState("err"); setStopMsg("stopCaptureService() not found."); return; }
+    if (result.stopped) {
+      setStopState("ok");
+      setStopMsg("Service stopped ✓ — token cleared. Next session requires new permission.");
+      setSvcRunning(false); setPermGranted(false);
+      setMpState("idle"); setMpMsg(""); setSvcState("idle"); setSvcMsg("");
+      await pollServiceStatus();
+    } else {
+      setStopState("err");
+      setStopMsg("Stop returned false — check logcat.");
+    }
+  }
 
-  const mpTestLabel =
-    mpTestState === "testing"
-      ? "Requesting MediaProjection permission…"
-      : mpTestState === "success"
-        ? "Permission granted — native capture ready ✓"
-        : mpTestState === "failed"
-          ? isExpoGo
-            ? "Native capture unavailable in Expo Go"
-            : "Permission denied or module missing"
-          : "Test MediaProjection Permission";
+  function btnColor(s: "idle" | "busy" | "ok" | "err") {
+    return s === "ok" ? colors.success : s === "err" ? colors.destructive : colors.accent;
+  }
 
-  const allModulesOk =
-    !isExpoGo &&
-    Object.values(moduleStatuses).every((s) => s === "available") &&
-    wiringStatus === "available";
+  // ── Row definitions ────────────────────────────────────────────────────────
 
-  const captureModuleExists = moduleStatuses["capture_module"] === "available";
+  const ROW_DEFS = [
+    {
+      key: "captureModule" as const,
+      title: "ZenLensCapture Module",
+      desc: "NativeModules.ZenLensCapture registered by ZenLensPackage.",
+      icon: "radio",
+    },
+    {
+      key: "wiringListener" as const,
+      title: "MediaProjection Permission Wiring",
+      desc: "ActivityEventListener registered — result from permission dialog reaches the module.",
+      icon: "link",
+    },
+    {
+      key: "permissionGranted" as const,
+      title: "MediaProjection Permission Granted",
+      desc: "User has granted screen recording for this session. Token cached in module.",
+      icon: "shield",
+    },
+    {
+      key: "serviceWiring" as const,
+      title: "Foreground Capture Service Wiring",
+      desc: "startCaptureService / stopCaptureService / getCaptureServiceStatus exposed.",
+      icon: "cpu",
+    },
+    {
+      key: "serviceRunning" as const,
+      title: "Foreground Capture Service Running",
+      desc: "ScreenCaptureService is active — persistent notification visible.",
+      icon: "activity",
+    },
+    {
+      key: "overlayModule" as const,
+      title: "System Overlay Module",
+      desc: "NativeModules.ZenLensOverlay registered (SYSTEM_ALERT_WINDOW overlay).",
+      icon: "layers",
+    },
+    {
+      key: "ocrModule" as const,
+      title: "ML Kit OCR Module",
+      desc: "NativeModules.ZenLensOCR registered (on-device text recognition).",
+      icon: "type",
+    },
+    {
+      key: "fileExport" as const,
+      title: "File Export",
+      desc: "expo-file-system + expo-sharing available.",
+      icon: "share-2",
+    },
+  ];
 
-  // ─── Render ───────────────────────────────────────────────────────────────
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
@@ -260,9 +365,7 @@ export default function ReadinessScreen() {
           style={({ pressed }) => [styles.backBtn, { opacity: pressed ? 0.6 : 1 }]}
         >
           <Feather name="arrow-left" size={18} color={colors.mutedForeground} />
-          <Text style={[styles.backText, { color: colors.mutedForeground }]}>
-            Back
-          </Text>
+          <Text style={[styles.backText, { color: colors.mutedForeground }]}>Back</Text>
         </Pressable>
 
         {/* Title */}
@@ -270,15 +373,13 @@ export default function ReadinessScreen() {
           <View style={[styles.iconCircle, { backgroundColor: `${colors.primary}18` }]}>
             <Feather name="cpu" size={28} color={colors.primary} />
           </View>
-          <Text style={[styles.title, { color: colors.foreground }]}>
-            Device Readiness
-          </Text>
+          <Text style={[styles.title, { color: colors.foreground }]}>Device Readiness</Text>
           <Text style={[styles.subtitle, { color: colors.mutedForeground }]}>
-            Checks all native Android modules required for real screen capture.
+            Live status of all native modules and the foreground service handoff path.
           </Text>
         </View>
 
-        {/* App Mode Banner */}
+        {/* Mode Banner */}
         <View
           style={[
             styles.modeBanner,
@@ -294,269 +395,184 @@ export default function ReadinessScreen() {
             color={isExpoGo ? colors.warning : colors.success}
           />
           <View style={{ flex: 1 }}>
-            <Text
-              style={[
-                styles.modeLabel,
-                { color: isExpoGo ? colors.warning : colors.success },
-              ]}
-            >
-              {isExpoGo ? "Expo Go Demo Mode" : "Native Android Build Mode"}
+            <Text style={[styles.modeLabel, { color: isExpoGo ? colors.warning : colors.success }]}>
+              {isExpoGo ? "Expo Go Demo Mode" : "Native Android Build"}
             </Text>
             <Text style={[styles.modeDesc, { color: colors.mutedForeground }]}>
               {isExpoGo
-                ? "Real screen capture is not included in this build. All 4 modules below will show ✗. Build the native APK to enable real capture."
-                : "Running as a native Android build. Native modules should be available."}
+                ? "Native modules, MediaProjection, and the foreground service all require a native APK build. Build with: npm run android:apk"
+                : "Running as a native build. All modules should be available below."}
             </Text>
           </View>
         </View>
 
-        {/* Module Checklist */}
-        <View style={styles.section}>
-          <Text style={[styles.sectionTitle, { color: colors.mutedForeground }]}>
-            Native Module Checklist
-          </Text>
+        {/* Refresh */}
+        <Pressable
+          onPress={runChecks}
+          style={({ pressed }) => [
+            styles.refreshBtn,
+            { backgroundColor: colors.secondary, borderColor: colors.border, opacity: pressed ? 0.7 : 1 },
+          ]}
+        >
+          <Feather name="refresh-cw" size={14} color={colors.mutedForeground} />
+          <Text style={[styles.refreshText, { color: colors.mutedForeground }]}>Refresh all checks</Text>
+        </Pressable>
 
-          {/* Static module rows */}
-          {MODULE_CHECKS.map((check) => {
-            const status = moduleStatuses[check.id] ?? "checking";
+        {/* ── 8 status rows ──────────────────────────────────────────────────── */}
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: colors.mutedForeground }]}>Native Module Checklist</Text>
+
+          {ROW_DEFS.map(({ key, title, desc, icon }) => {
+            const row = rows[key];
             return (
               <View
-                key={check.id}
-                style={[styles.checkRow, { backgroundColor: colors.card, borderColor: colors.border }]}
+                key={key}
+                style={[
+                  styles.checkRow,
+                  {
+                    backgroundColor: colors.card,
+                    borderColor: statusBorder(row.status, colors),
+                    borderWidth: row.status === "warn" ? 1.5 : 1,
+                  },
+                ]}
               >
                 <View style={[styles.checkIcon, { backgroundColor: `${colors.primary}14` }]}>
-                  <Feather name={check.icon as any} size={16} color={colors.primary} />
+                  <Feather name={icon as any} size={16} color={colors.primary} />
                 </View>
                 <View style={styles.checkContent}>
-                  <Text style={[styles.checkTitle, { color: colors.foreground }]}>
-                    {check.title}
-                  </Text>
-                  <Text style={[styles.checkDesc, { color: colors.mutedForeground }]}>
-                    {check.description}
-                  </Text>
-                  {check.nativeKey && (
-                    <Text style={[styles.moduleKey, { color: colors.mutedForeground }]}>
-                      NativeModules.{check.nativeKey}
+                  <Text style={[styles.checkTitle, { color: colors.foreground }]}>{title}</Text>
+                  <Text style={[styles.checkDesc, { color: colors.mutedForeground }]}>{desc}</Text>
+                  {row.detail ? (
+                    <Text
+                      style={[
+                        styles.checkDetail,
+                        {
+                          color:
+                            row.status === "ok"
+                              ? colors.success
+                              : row.status === "warn"
+                                ? colors.warning
+                                : colors.destructive,
+                        },
+                      ]}
+                    >
+                      {row.detail}
                     </Text>
-                  )}
+                  ) : null}
                 </View>
-                <StatusIcon status={status} colors={colors} />
+                <RowIcon status={row.status} colors={colors} />
               </View>
             );
           })}
-
-          {/* Permission Wiring Row — separate from module existence */}
-          <View
-            style={[
-              styles.checkRow,
-              {
-                backgroundColor: colors.card,
-                borderColor:
-                  wiringStatus === "partial"
-                    ? `${colors.warning}66`
-                    : colors.border,
-                borderWidth: wiringStatus === "partial" ? 1.5 : 1,
-              },
-            ]}
-          >
-            <View
-              style={[
-                styles.checkIcon,
-                {
-                  backgroundColor:
-                    wiringStatus === "partial"
-                      ? `${colors.warning}20`
-                      : `${colors.primary}14`,
-                },
-              ]}
-            >
-              <Feather
-                name="link"
-                size={16}
-                color={
-                  wiringStatus === "partial" ? colors.warning : colors.primary
-                }
-              />
-            </View>
-            <View style={styles.checkContent}>
-              <Text style={[styles.checkTitle, { color: colors.foreground }]}>
-                MediaProjection Permission Wiring
-              </Text>
-              <Text style={[styles.checkDesc, { color: colors.mutedForeground }]}>
-                ActivityEventListener registered + onMediaProjectionResult() wired
-                to resolve the JS promise when Android grants/denies the dialog.
-              </Text>
-              {wiringMessage ? (
-                <Text
-                  style={[
-                    styles.wiringMsg,
-                    {
-                      color:
-                        wiringStatus === "available"
-                          ? colors.success
-                          : wiringStatus === "partial"
-                            ? colors.warning
-                            : colors.destructive,
-                    },
-                  ]}
-                >
-                  {wiringMessage}
-                </Text>
-              ) : null}
-              {wiringDetail && (
-                <Text style={[styles.moduleKey, { color: colors.mutedForeground }]}>
-                  requestCode={wiringDetail.requestCode} · permissionGranted=
-                  {String(wiringDetail.permissionGranted)}
-                </Text>
-              )}
-            </View>
-            <StatusIcon status={wiringStatus} colors={colors} />
-          </View>
         </View>
 
-        {/* "Honest" warning: module exists but wiring is broken */}
-        {captureModuleExists && wiringStatus === "partial" && (
-          <View
-            style={[
-              styles.warningBox,
-              { backgroundColor: `${colors.warning}14`, borderColor: `${colors.warning}44` },
-            ]}
-          >
-            <Feather name="alert-triangle" size={16} color={colors.warning} />
-            <Text style={[styles.warningText, { color: colors.warning }]}>
-              Native module found, but MediaProjection permission wiring is
-              incomplete. The capture button will appear to work, but the
-              permission dialog will never resolve. Rebuild the APK with the
-              updated ScreenCaptureModule.kt.
-            </Text>
-          </View>
-        )}
-
-        {/* Overall summary */}
-        {!isExpoGo && (
-          <View
-            style={[
-              styles.summaryBox,
-              {
-                backgroundColor: allModulesOk
-                  ? `${colors.success}12`
-                  : `${colors.destructive}12`,
-                borderColor: allModulesOk
-                  ? `${colors.success}33`
-                  : `${colors.destructive}33`,
-              },
-            ]}
-          >
-            <Feather
-              name={allModulesOk ? "check-circle" : "alert-circle"}
-              size={16}
-              color={allModulesOk ? colors.success : colors.destructive}
-            />
-            <Text
-              style={[
-                styles.summaryText,
-                { color: allModulesOk ? colors.success : colors.destructive },
-              ]}
-            >
-              {allModulesOk
-                ? "All native modules wired — ZenLens is ready for real capture."
-                : "One or more modules are missing or incomplete. Fix issues above and rebuild."}
-            </Text>
-          </View>
-        )}
-
-        {/* Native Capture Test */}
+        {/* ── Native Handoff Test ────────────────────────────────────────────── */}
         <View style={styles.section}>
           <Text style={[styles.sectionTitle, { color: colors.mutedForeground }]}>
-            Native Capture Test
+            Native Handoff Test
           </Text>
+          <Text style={[styles.testHint, { color: colors.mutedForeground }]}>
+            {isExpoGo
+              ? "All three tests require a native APK build."
+              : "Run in order: grant permission → start service → stop service. If all three pass, the handoff is proven."}
+          </Text>
+
+          {/* Permission */}
           <Pressable
-            onPress={handleTestMediaProjection}
-            disabled={mpTestState === "testing"}
+            onPress={handleTestPermission}
+            disabled={mpState === "busy"}
             style={({ pressed }) => [
               styles.testBtn,
               {
-                backgroundColor:
-                  mpTestState === "success"
-                    ? `${colors.success}18`
-                    : mpTestState === "failed"
-                      ? `${colors.destructive}18`
-                      : `${colors.primary}18`,
-                borderColor:
-                  mpTestState === "success"
-                    ? `${colors.success}55`
-                    : mpTestState === "failed"
-                      ? `${colors.destructive}55`
-                      : `${colors.primary}55`,
-                opacity: mpTestState === "testing" || pressed ? 0.75 : 1,
+                backgroundColor: mpState === "ok" ? `${colors.success}14` : mpState === "err" ? `${colors.destructive}14` : `${colors.primary}14`,
+                borderColor: mpState === "ok" ? `${colors.success}44` : mpState === "err" ? `${colors.destructive}44` : `${colors.primary}44`,
+                opacity: mpState === "busy" || pressed ? 0.7 : 1,
               },
             ]}
           >
-            {mpTestState === "testing" ? (
-              <ActivityIndicator size="small" color={colors.primary} />
-            ) : (
-              <Feather name="play" size={16} color={mpTestColor} />
-            )}
-            <Text style={[styles.testBtnText, { color: mpTestColor }]}>
-              {mpTestLabel}
-            </Text>
+            {mpState === "busy" ? <ActivityIndicator size="small" color={colors.primary} /> : <Feather name="shield" size={15} color={btnColor(mpState)} />}
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.testBtnLabel, { color: btnColor(mpState) }]}>Test MediaProjection Permission</Text>
+              <Text style={[styles.testBtnSub, { color: mpMsg ? btnColor(mpState) : colors.mutedForeground }]}>
+                {mpMsg || "Opens Android 'Start recording?' dialog"}
+              </Text>
+            </View>
           </Pressable>
 
-          <Text style={[styles.testHint, { color: colors.mutedForeground }]}>
-            {isExpoGo
-              ? "Requires native APK build. Expo Go cannot open the Android MediaProjection dialog."
-              : mpTestState === "idle"
-                ? "Tapping this requests MediaProjection permission from Android. A system dialog titled 'Start recording?' will appear. Tap 'Start now' to grant."
-                : mpTestState === "success"
-                  ? "Android opened the permission dialog and you granted it. The wiring is confirmed working end-to-end."
-                  : mpTestState === "failed"
-                    ? "Permission was denied or the wiring is incomplete. Check the checklist above."
-                    : ""}
-          </Text>
+          {/* Start service */}
+          <Pressable
+            onPress={handleStartService}
+            disabled={svcState === "busy" || (!permGranted && !isExpoGo)}
+            style={({ pressed }) => [
+              styles.testBtn,
+              {
+                backgroundColor: svcState === "ok" ? `${colors.success}14` : svcState === "err" ? `${colors.destructive}14` : `${colors.primary}14`,
+                borderColor: svcState === "ok" ? `${colors.success}44` : svcState === "err" ? `${colors.destructive}44` : `${colors.primary}44`,
+                opacity: svcState === "busy" || (!permGranted && !isExpoGo) || pressed ? 0.45 : 1,
+              },
+            ]}
+          >
+            {svcState === "busy" ? <ActivityIndicator size="small" color={colors.primary} /> : <Feather name="play-circle" size={15} color={btnColor(svcState)} />}
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.testBtnLabel, { color: btnColor(svcState) }]}>Test Foreground Capture Service</Text>
+              <Text style={[styles.testBtnSub, { color: svcMsg ? btnColor(svcState) : colors.mutedForeground }]}>
+                {svcMsg || (permGranted ? "Starts ScreenCaptureService — check notification bar" : "Grant permission first")}
+              </Text>
+            </View>
+          </Pressable>
+
+          {/* Stop service */}
+          <Pressable
+            onPress={handleStopService}
+            disabled={stopState === "busy" || (!svcRunning && !isExpoGo)}
+            style={({ pressed }) => [
+              styles.testBtn,
+              {
+                backgroundColor: stopState === "ok" ? `${colors.success}14` : stopState === "err" ? `${colors.destructive}14` : `${colors.primary}14`,
+                borderColor: stopState === "ok" ? `${colors.success}44` : stopState === "err" ? `${colors.destructive}44` : `${colors.primary}44`,
+                opacity: stopState === "busy" || (!svcRunning && !isExpoGo) || pressed ? 0.45 : 1,
+              },
+            ]}
+          >
+            {stopState === "busy" ? <ActivityIndicator size="small" color={colors.primary} /> : <Feather name="stop-circle" size={15} color={btnColor(stopState)} />}
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.testBtnLabel, { color: btnColor(stopState) }]}>Stop Capture Service</Text>
+              <Text style={[styles.testBtnSub, { color: stopMsg ? btnColor(stopState) : colors.mutedForeground }]}>
+                {stopMsg || (svcRunning ? "Stops service, clears token — notification disappears" : "Start service first")}
+              </Text>
+            </View>
+          </Pressable>
         </View>
 
         {/* Build Guide */}
         <View style={styles.section}>
-          <Text style={[styles.sectionTitle, { color: colors.mutedForeground }]}>
-            Build Guide
-          </Text>
-          <View
-            style={[styles.buildGuide, { backgroundColor: colors.card, borderColor: colors.border }]}
-          >
+          <Text style={[styles.sectionTitle, { color: colors.mutedForeground }]}>Build & Test Order</Text>
+          <View style={[styles.buildGuide, { backgroundColor: colors.card, borderColor: colors.border }]}>
             {[
-              {
-                step: "1. Prebuild + copy native modules",
-                code: "npm run android:prebuild",
-                note: "Generates android/ and runs the config plugin (copies Kotlin, patches manifests, wires MainActivity).",
-              },
-              {
-                step: "2. Verify integration",
-                code: "npm run android:verify-native",
-                note: "Checks all 5 Kotlin files, all manifest entries, ActivityEventListener wiring, and MainActivity patch.",
-              },
-              {
-                step: "3. Build APK via EAS",
-                code: "npm run android:apk",
-                note: "Submits to EAS Build. Download the APK from the EAS dashboard or via 'eas build:list'.",
-              },
-              {
-                step: "4. Install and verify",
-                code: "adb install zen-lens.apk",
-                note: "Open ZenLens → Device Readiness → all rows green → Native Capture Test → grant dialog.",
-              },
-            ].map(({ step, code, note }) => (
-              <View key={step} style={styles.buildStepBlock}>
-                <Text style={[styles.buildStepLabel, { color: colors.foreground }]}>
-                  {step}
-                </Text>
-                <View style={[styles.codeBlock, { backgroundColor: colors.secondary }]}>
-                  <Text style={[styles.code, { color: colors.accent }]} selectable>
-                    {code}
-                  </Text>
+              { n: "1", label: "Build APK", code: "npm run android:apk" },
+              { n: "2", label: "Install on real Android device", code: "adb install zen-lens.apk" },
+              { n: "3", label: "Open ZenLens → Device Readiness" },
+              { n: "4", label: "Confirm ZenLensCapture module row shows ✓" },
+              { n: "5", label: "Tap Test MediaProjection Permission", note: "Android dialog appears — tap 'Start now'" },
+              { n: "6", label: "Tap Test Foreground Capture Service", note: "Persistent notification appears in status bar" },
+              { n: "7", label: "Tap Stop Capture Service", note: "Notification disappears — token cleared" },
+              { n: "8", label: "If all pass: next step is single-frame capture", note: "Do not add OCR yet" },
+            ].map(({ n, label, code, note }) => (
+              <View key={n} style={styles.buildStep}>
+                <View style={[styles.stepNum, { backgroundColor: `${colors.primary}18` }]}>
+                  <Text style={[styles.stepNumText, { color: colors.primary }]}>{n}</Text>
                 </View>
-                <Text style={[styles.buildNote, { color: colors.mutedForeground }]}>
-                  {note}
-                </Text>
+                <View style={{ flex: 1, gap: 4 }}>
+                  <Text style={[styles.stepLabel, { color: colors.foreground }]}>{label}</Text>
+                  {code && (
+                    <View style={[styles.codeBlock, { backgroundColor: colors.secondary }]}>
+                      <Text style={[styles.code, { color: colors.accent }]} selectable>{code}</Text>
+                    </View>
+                  )}
+                  {note && (
+                    <Text style={[styles.stepNote, { color: colors.mutedForeground }]}>{note}</Text>
+                  )}
+                </View>
               </View>
             ))}
           </View>
@@ -572,59 +588,32 @@ const styles = StyleSheet.create({
   backBtn: { flexDirection: "row", alignItems: "center", gap: 6, alignSelf: "flex-start" },
   backText: { fontSize: 14, fontFamily: "Inter_400Regular" },
   titleBlock: { alignItems: "center", gap: 10, paddingVertical: 8 },
-  iconCircle: {
-    width: 64, height: 64, borderRadius: 20,
-    alignItems: "center", justifyContent: "center", marginBottom: 4,
-  },
+  iconCircle: { width: 64, height: 64, borderRadius: 20, alignItems: "center", justifyContent: "center", marginBottom: 4 },
   title: { fontSize: 22, fontFamily: "Inter_700Bold", textAlign: "center" },
-  subtitle: {
-    fontSize: 14, fontFamily: "Inter_400Regular",
-    textAlign: "center", lineHeight: 20, paddingHorizontal: 8,
-  },
-  modeBanner: {
-    flexDirection: "row", gap: 10, padding: 14,
-    borderRadius: 12, borderWidth: 1, alignItems: "flex-start",
-  },
+  subtitle: { fontSize: 14, fontFamily: "Inter_400Regular", textAlign: "center", lineHeight: 20, paddingHorizontal: 8 },
+  modeBanner: { flexDirection: "row", gap: 10, padding: 14, borderRadius: 12, borderWidth: 1, alignItems: "flex-start" },
   modeLabel: { fontSize: 13, fontFamily: "Inter_700Bold", marginBottom: 3 },
   modeDesc: { fontSize: 12, fontFamily: "Inter_400Regular", lineHeight: 17 },
+  refreshBtn: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, paddingVertical: 10, borderRadius: 10, borderWidth: 1 },
+  refreshText: { fontSize: 13, fontFamily: "Inter_500Medium" },
   section: { gap: 8 },
-  sectionTitle: {
-    fontSize: 11, fontFamily: "Inter_600SemiBold",
-    letterSpacing: 0.8, textTransform: "uppercase", paddingHorizontal: 2,
-  },
-  checkRow: {
-    flexDirection: "row", alignItems: "flex-start",
-    gap: 12, padding: 14, borderRadius: 12, borderWidth: 1,
-  },
-  checkIcon: {
-    width: 32, height: 32, borderRadius: 8,
-    alignItems: "center", justifyContent: "center", marginTop: 1,
-  },
+  sectionTitle: { fontSize: 11, fontFamily: "Inter_600SemiBold", letterSpacing: 0.8, textTransform: "uppercase", paddingHorizontal: 2 },
+  checkRow: { flexDirection: "row", alignItems: "flex-start", gap: 12, padding: 14, borderRadius: 12, borderWidth: 1 },
+  checkIcon: { width: 32, height: 32, borderRadius: 8, alignItems: "center", justifyContent: "center", marginTop: 1 },
   checkContent: { flex: 1, gap: 3 },
   checkTitle: { fontSize: 14, fontFamily: "Inter_600SemiBold" },
   checkDesc: { fontSize: 12, fontFamily: "Inter_400Regular", lineHeight: 17 },
-  moduleKey: { fontSize: 10, fontFamily: "Inter_400Regular", marginTop: 2, opacity: 0.7 },
-  wiringMsg: { fontSize: 11, fontFamily: "Inter_500Medium", marginTop: 4, lineHeight: 16 },
-  warningBox: {
-    flexDirection: "row", gap: 10, padding: 14,
-    borderRadius: 12, borderWidth: 1, alignItems: "flex-start",
-  },
-  warningText: { flex: 1, fontSize: 12, fontFamily: "Inter_500Medium", lineHeight: 18 },
-  summaryBox: {
-    flexDirection: "row", gap: 10, padding: 14,
-    borderRadius: 12, borderWidth: 1, alignItems: "flex-start",
-  },
-  summaryText: { flex: 1, fontSize: 13, fontFamily: "Inter_500Medium", lineHeight: 18 },
-  testBtn: {
-    flexDirection: "row", alignItems: "center", justifyContent: "center",
-    gap: 8, paddingVertical: 15, borderRadius: 12, borderWidth: 1,
-  },
-  testBtnText: { fontSize: 14, fontFamily: "Inter_600SemiBold" },
+  checkDetail: { fontSize: 11, fontFamily: "Inter_500Medium", marginTop: 4, lineHeight: 16 },
   testHint: { fontSize: 12, fontFamily: "Inter_400Regular", lineHeight: 17, paddingHorizontal: 2 },
-  buildGuide: { padding: 16, borderRadius: 12, borderWidth: 1, gap: 16 },
-  buildStepBlock: { gap: 6 },
-  buildStepLabel: { fontSize: 13, fontFamily: "Inter_600SemiBold" },
-  codeBlock: { padding: 10, borderRadius: 8 },
+  testBtn: { flexDirection: "row", alignItems: "flex-start", gap: 10, padding: 14, borderRadius: 12, borderWidth: 1 },
+  testBtnLabel: { fontSize: 14, fontFamily: "Inter_600SemiBold", marginBottom: 3 },
+  testBtnSub: { fontSize: 12, fontFamily: "Inter_400Regular", lineHeight: 17 },
+  buildGuide: { padding: 16, borderRadius: 12, borderWidth: 1, gap: 14 },
+  buildStep: { flexDirection: "row", gap: 10, alignItems: "flex-start" },
+  stepNum: { width: 26, height: 26, borderRadius: 8, alignItems: "center", justifyContent: "center" },
+  stepNumText: { fontSize: 12, fontFamily: "Inter_700Bold" },
+  stepLabel: { fontSize: 13, fontFamily: "Inter_600SemiBold" },
+  codeBlock: { padding: 8, borderRadius: 6 },
   code: { fontSize: 12, fontFamily: "Inter_400Regular" },
-  buildNote: { fontSize: 11, fontFamily: "Inter_400Regular", lineHeight: 16 },
+  stepNote: { fontSize: 11, fontFamily: "Inter_400Regular", lineHeight: 16 },
 });
