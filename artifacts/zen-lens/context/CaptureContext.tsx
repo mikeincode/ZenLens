@@ -8,6 +8,7 @@ import React, {
 } from "react";
 import { clearDedupeHistory, dedupeAppendText } from "@/utils/dedupe";
 import {
+  isNativeAvailable,
   recognizeTextFromCrop,
   requestMediaProjectionPermission,
   requestOverlayPermission,
@@ -90,9 +91,8 @@ export function CaptureProvider({ children }: { children: React.ReactNode }) {
   const [overlayPermission, setOverlayPermission] =
     useState<PermissionStatus>("unknown");
 
-  const captureIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
-    null
-  );
+  const captureIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const autoSaveIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const transcriptRef = useRef(transcript);
   const cropRectRef = useRef(cropRect);
   const settingsRef = useRef(settings);
@@ -123,6 +123,10 @@ export function CaptureProvider({ children }: { children: React.ReactNode }) {
     if (captureIntervalRef.current) {
       clearInterval(captureIntervalRef.current);
       captureIntervalRef.current = null;
+    }
+    if (autoSaveIntervalRef.current) {
+      clearInterval(autoSaveIntervalRef.current);
+      autoSaveIntervalRef.current = null;
     }
   }, []);
 
@@ -202,6 +206,12 @@ export function CaptureProvider({ children }: { children: React.ReactNode }) {
       runOcrFrame,
       settingsRef.current.ocrInterval
     );
+    // 10-second periodic autosave while capture is active
+    autoSaveIntervalRef.current = setInterval(() => {
+      if (transcriptRef.current) {
+        saveTranscript(transcriptRef.current);
+      }
+    }, 10_000);
   }, [
     mediaProjectionPermission,
     requestPermissions,
@@ -277,7 +287,7 @@ export function CaptureProvider({ children }: { children: React.ReactNode }) {
         appendedCount,
         mediaProjectionPermission,
         overlayPermission,
-        isSimulated: !false,
+        isSimulated: !isNativeAvailable(),
         requestPermissions,
         startCapture,
         stopCapture,

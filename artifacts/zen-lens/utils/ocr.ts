@@ -1,3 +1,4 @@
+import Constants from "expo-constants";
 import { Platform } from "react-native";
 
 export interface OcrResult {
@@ -123,6 +124,13 @@ function getNativeCaptureModule(): any {
   } catch {
     return null;
   }
+}
+
+export function isExpoGo(): boolean {
+  return (
+    Constants.appOwnership === "expo" ||
+    Constants.executionEnvironment === "storeClient"
+  );
 }
 
 export function isNativeAvailable(): boolean {

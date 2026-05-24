@@ -29,6 +29,7 @@ function RootLayoutNav() {
       <Stack.Screen name="crop" />
       <Stack.Screen name="transcript" />
       <Stack.Screen name="settings" />
+      <Stack.Screen name="readiness" />
     </Stack>
   );
 }
