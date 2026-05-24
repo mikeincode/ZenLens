@@ -1,141 +1,238 @@
 # ZenLens
 
-**A scrolling OCR clipboard for Android.** Capture text from any app by recording your screen,
-drawing a crop box over the text area, and letting ZenLens run OCR as you scroll. All processing
-is on-device — nothing is uploaded.
+**A scrolling OCR clipboard for Android.** Captures text from any app using screen recording,
+a draggable crop box, and on-device OCR — everything stays on your device.
 
 ---
 
-## Quick Start (Expo Go / Simulation)
+## Two Modes
 
-```bash
-# Install dependencies
-pnpm install
-
-# Start the Expo dev server
-pnpm --filter @workspace/zen-lens run dev
-```
-
-Scan the QR code with **Expo Go** on your Android device. The app runs in simulation mode —
-all features work with pre-generated sample text. No screen capture or real OCR occurs.
-
----
-
-## Feature Status
-
-| Feature | Expo Go | Custom Build |
+| | Expo Go (demo) | Native APK (real capture) |
 |---|---|---|
 | UI / Navigation | ✅ | ✅ |
 | Transcript editor | ✅ | ✅ |
-| Dedupe logic | ✅ | ✅ |
-| Settings persistence | ✅ | ✅ |
-| Export (Copy/Share/.TXT) | ✅ | ✅ |
-| Simulated OCR scrolling | ✅ | ✅ |
-| MediaProjection screen capture | ❌ | ✅ |
-| Foreground service notification | ❌ | ✅ |
-| Floating overlay button | ❌ | ✅ |
-| Google ML Kit OCR | ❌ | ✅ |
+| Dedupe / auto-save | ✅ | ✅ |
+| Export (Copy / Share / .TXT) | ✅ | ✅ |
+| Simulated OCR (sample text) | ✅ | ✅ |
+| **MediaProjection screen capture** | ❌ | ✅ |
+| **Foreground service notification** | ❌ | ✅ |
+| **Floating overlay button** | ❌ | ✅ |
+| **Google ML Kit OCR** | ❌ | ✅ |
+
+The home screen always shows a banner indicating which mode is active.
+Tap **Device Readiness** to see a live checklist of all native module statuses.
 
 ---
 
-## Building for Android (Real Capture)
+## Quick Start — Expo Go (UI demo)
+
+```bash
+pnpm install
+pnpm --filter @workspace/zen-lens run dev
+```
+
+Scan the QR code with Expo Go on Android. All screens are fully functional with
+simulated scrolling text. No native modules, no screen capture.
+
+---
+
+## Build a Real APK (Native Capture)
 
 ### Prerequisites
 
-- Node.js 18+, pnpm
-- Android Studio with SDK 21+
-- A physical Android device (emulators cannot test MediaProjection)
+- Node.js 18+, pnpm (already set up in this repo)
+- An [Expo account](https://expo.dev/signup) (free tier works)
+- `eas-cli` (installed automatically by the build script if missing)
+- A physical Android device — emulators cannot use MediaProjection
 
-### Steps
+### One-command build
 
-1. **Prebuild** (ejects to bare workflow):
-   ```bash
-   npx expo prebuild --platform android
-   ```
-
-2. **Copy native modules** from `android-native/` into
-   `android/app/src/main/java/com/zenlens/app/`
-
-3. **Follow** `android-native/README.md` for manifest, dependency, and MainActivity changes.
-
-4. **Run on device:**
-   ```bash
-   npx expo run:android
-   ```
-
-5. **Production APK:**
-   ```bash
-   npx eas build --platform android --profile production
-   ```
-
----
-
-## Architecture
-
-```
-artifacts/zen-lens/
-├── app/
-│   ├── _layout.tsx          # Root layout — Stack navigation, providers
-│   ├── index.tsx            # Home screen
-│   ├── setup.tsx            # Permissions screen
-│   ├── crop.tsx             # Crop box configuration
-│   ├── transcript.tsx       # Live transcript editor
-│   └── settings.tsx         # OCR / dedupe / storage settings
-├── context/
-│   ├── CaptureContext.tsx   # Capture state machine, OCR loop
-│   └── SettingsContext.tsx  # Settings with AsyncStorage persistence
-├── utils/
-│   ├── dedupe.ts            # dedupeAppendText — overlap detection
-│   ├── ocr.ts               # OCR bridge (native → simulation fallback)
-│   └── storage.ts           # AsyncStorage helpers
-├── components/
-│   ├── CropBox.tsx          # Draggable/resizable crop rectangle
-│   ├── StatusPill.tsx       # Live capture status indicator
-│   └── PermissionRow.tsx    # Permission checklist item
-└── android-native/          # Kotlin source for native modules
-    ├── ScreenCaptureModule.kt
-    ├── ScreenCaptureService.kt
-    ├── OverlayModule.kt
-    ├── MLKitOCRModule.kt
-    ├── ZenLensPackage.kt
-    └── README.md            # Full integration guide
+```bash
+cd artifacts/zen-lens
+npm run android:apk
 ```
 
+This script does the following automatically:
+1. Checks for `eas-cli` and installs it if missing
+2. Prompts for EAS login if not authenticated
+3. Runs `npx expo prebuild --platform android --clean`
+   - The **config plugin** (`plugins/withZenLensNativeModules.js`) runs during prebuild and:
+     - Copies all 5 Kotlin files from `android-native/` into `android/app/src/main/java/com/zenlens/app/`
+     - Injects all required permissions into `AndroidManifest.xml`
+     - Declares `ScreenCaptureService` with `foregroundServiceType="mediaProjection"`
+     - Registers `ZenLensPackage` in `MainApplication.kt`
+4. Verifies every native module, permission, and registration is present
+5. Runs `eas build --platform android --profile preview`
+6. Prints download link and install instructions
+
+### Download and install the APK
+
+After the EAS build completes (~5-10 min):
+
+```bash
+# List your builds and get the download URL
+eas build:list --platform android
+
+# Install via USB (requires adb)
+adb install path/to/zen-lens.apk
+```
+
+Or open the EAS build URL on your Android device and tap **Install**.
+
+### Verify native modules on device
+
+After installing:
+1. Open ZenLens on your device
+2. Tap **Device Readiness** on the home screen
+3. All 4 rows must show ✓:
+   - MediaProjection Capture (`NativeModules.ZenLensCapture`)
+   - ML Kit OCR (`NativeModules.ZenLensOCR`)
+   - System Overlay (`NativeModules.ZenLensOverlay`)
+   - File Export
+4. Tap **Native Capture Test** — Android will show the MediaProjection system dialog
+5. Tap "Start now" → status changes to "Native capture granted ✓"
+
 ---
 
-## Dedupe Algorithm
+## Manual Native Integration (if not using EAS)
 
-`utils/dedupe.ts` implements `dedupeAppendText(existing, newOCR, options)`:
+If you want to build locally with Android Studio or `npx expo run:android`:
 
-1. Normalize whitespace in both texts
-2. Split into lines, filter empty lines
-3. Check the last 30 lines of existing against the first 30 lines of new
-4. Find the longest suffix/prefix overlap (sliding window)
-5. Append only the non-overlapping tail from new OCR
-6. Reject frames with < `minLength` meaningful characters
-7. Maintain a circular history of the last 5 OCR chunks to prevent looping
+```bash
+# 1. Generate android/ directory
+npm run android:prebuild
 
-Settings:
-- `dedupeAggressiveness: 0` — off (always append)
-- `dedupeAggressiveness: 1` — normal (overlap detection only)
-- `dedupeAggressiveness: 2` — aggressive (also checks full containment)
+# 2. Copy Kotlin files + patch AndroidManifest + register package
+npm run android:sync-native
+
+# 3. Verify everything is in place
+npm run android:verify-native
+
+# 4. Add ML Kit to android/app/build.gradle (must be done manually):
+#    dependencies {
+#      implementation "com.google.mlkit:text-recognition:16.0.1"
+#    }
+
+# 5. Build and launch on connected device
+npm run android:run
+```
 
 ---
 
-## Privacy
+## npm Scripts Reference
 
-- **No network access.** ZenLens has no API calls and no analytics.
-- **On-device OCR only.** ML Kit Text Recognition runs entirely on the device.
-- **No screenshot storage.** Frames are processed in memory and immediately recycled.
-- **Local transcript only.** Transcript is stored in Android app private storage via AsyncStorage.
+| Script | What it does |
+|---|---|
+| `npm run dev` | Start Expo dev server (Expo Go / web) |
+| `npm run android:prebuild` | `expo prebuild --platform android --clean` |
+| `npm run android:sync-native` | Copy Kotlin files + patch manifest (manual fallback) |
+| `npm run android:verify-native` | Verify all native modules are present and correct |
+| `npm run android:apk` | Full end-to-end APK build via EAS (preview profile) |
+| `npm run android:apk:dev` | EAS development build (with dev client) |
+| `npm run android:apk:prod` | EAS production AAB for Play Store |
+| `npm run android:run` | Build and install on connected USB device |
+
+---
+
+## EAS Build Profiles (`eas.json`)
+
+| Profile | Type | Use case |
+|---|---|---|
+| `development` | APK (debug) | Dev client build with hot reload |
+| `preview` | APK (release) | Internal testing, direct install |
+| `production` | AAB | Google Play Store submission |
+
+---
+
+## Native Module Architecture
+
+```
+android-native/                      Source of truth for Kotlin
+├── ScreenCaptureModule.kt           MediaProjection + frame crop → base64
+├── ScreenCaptureService.kt          Foreground service (Android requirement)
+├── OverlayModule.kt                 SYSTEM_ALERT_WINDOW floating control
+├── MLKitOCRModule.kt                Google ML Kit text recognition
+└── ZenLensPackage.kt                ReactPackage that registers all 4 modules
+
+plugins/
+└── withZenLensNativeModules.js      Config plugin — copies + patches during prebuild
+
+scripts/
+├── build-apk.sh                     End-to-end EAS build with verification
+├── sync-native-android.js           Manual copy + manifest patch (fallback)
+└── verify-native-android.js         Checks all native integration points
+```
+
+JS ↔ Native bridge names:
+- `NativeModules.ZenLensCapture` — screen frame capture, MediaProjection permission
+- `NativeModules.ZenLensOCR` — ML Kit text recognition
+- `NativeModules.ZenLensOverlay` — system overlay show/hide
+
+---
+
+## Architecture Notes
+
+- **Simulation mode**: `utils/ocr.ts` checks `NativeModules.ZenLensCapture` at runtime.
+  If absent (Expo Go), falls back to progressive sample text — all dedupe, transcript,
+  and export logic runs identically.
+- **CaptureContext**: single state machine (`idle → requesting_permission → ready → capturing → paused`).
+  Auto-saves transcript on every append (if `autoSave` on) and every 10 seconds while capturing.
+- **CropBox**: PanResponder drag-move + 4 corner resize handles. No third-party gesture libraries.
+- **dedupeAppendText**: compares last 30 lines of existing transcript with first 30 lines of new
+  text, finds longest overlap, appends only the new tail. Maintains circular history of 5 chunks.
 
 ---
 
 ## Known Limitations
 
-See `android-native/README.md` for the full list. Key ones:
+1. **Expo Go** — MediaProjection, SYSTEM_ALERT_WINDOW, and ML Kit require a custom build.
+   `NativeModules.ZenLens*` will always be `undefined` in Expo Go.
+2. **Android 10+ foreground service type** — `foregroundServiceType="mediaProjection"` is required
+   on API 29+. The config plugin and sync script both ensure this is present.
+3. **Overlay permission UX** — `SYSTEM_ALERT_WINDOW` cannot use the standard permissions dialog.
+   ZenLens's Setup screen sends the user to `Settings.ACTION_MANAGE_OVERLAY_PERMISSION`.
+4. **Screen rotation** — Capture dimensions are fixed at start time. Stop and restart if the device rotates.
+5. **ML Kit first-run** — ~4 MB model download on first launch unless bundled via the ML Kit plugin.
+6. **Physical device required** — Android emulators cannot use the MediaProjection API.
 
-- Expo Go cannot run real screen capture — simulation mode only
-- The floating overlay requires manual Settings permission (SYSTEM_ALERT_WINDOW)
-- Screen rotation during capture may misalign the crop box
-- ML Kit downloads ~4MB model on first real-device run
+---
+
+## File Map
+
+```
+artifacts/zen-lens/
+├── app/
+│   ├── _layout.tsx          Root layout, providers, font loading
+│   ├── index.tsx            Home screen (mode banner, capture button, native test)
+│   ├── setup.tsx            Permission checklist + grant flow
+│   ├── crop.tsx             Draggable/resizable crop box
+│   ├── transcript.tsx       Live OCR output, edit, export
+│   ├── settings.tsx         OCR interval, confidence, dedupe, auto-save
+│   └── readiness.tsx        Native module checklist + build guide
+├── context/
+│   ├── CaptureContext.tsx   Capture state machine + OCR loop + auto-save
+│   └── SettingsContext.tsx  Settings persistence
+├── utils/
+│   ├── ocr.ts               Native bridge + simulation fallback + isExpoGo()
+│   ├── dedupe.ts            dedupeAppendText with overlap detection
+│   └── storage.ts           AsyncStorage wrappers
+├── components/
+│   ├── CropBox.tsx          PanResponder crop UI
+│   ├── StatusPill.tsx       Capture state indicator
+│   └── PermissionRow.tsx    Permission checklist row
+├── plugins/
+│   └── withZenLensNativeModules.js   Expo config plugin
+├── scripts/
+│   ├── build-apk.sh                  End-to-end EAS build
+│   ├── sync-native-android.js        Manual native sync
+│   └── verify-native-android.js      Integration verification
+├── android-native/
+│   ├── ScreenCaptureModule.kt
+│   ├── ScreenCaptureService.kt
+│   ├── OverlayModule.kt
+│   ├── MLKitOCRModule.kt
+│   ├── ZenLensPackage.kt
+│   └── README.md            Detailed manual integration guide
+├── app.json                 Expo config (registers config plugin)
+└── eas.json                 EAS build profiles
+```
