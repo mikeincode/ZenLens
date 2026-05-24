@@ -203,7 +203,7 @@ keep the sentinel comment so the scripts remain idempotent.
 
 ---
 
-## Native APK Test Order — Foreground Service Handoff
+## Native APK Test Order — Single-Frame Capture Checkpoint
 
 Run this exact sequence on a **physical Android device** (emulators cannot use MediaProjection):
 
@@ -220,12 +220,13 @@ adb install zen-lens.apk
 
 **Step 3 — Open ZenLens → Device Readiness**
 
-The 8 status rows should show:
+The 9 status rows should show:
 - **ZenLensCapture Module** — ✓
 - **MediaProjection Permission Wiring** — ✓ (ActivityEventListener registered, requestCode=1001)
 - **MediaProjection Permission Granted** — ✗ (not yet granted)
 - **Foreground Capture Service Wiring** — ✓ (all 3 methods present)
 - **Foreground Capture Service Running** — ✗ (not yet started)
+- **Single-Frame Capture Wiring** — ✓ (captureSingleFrame() available)
 - **System Overlay Module** — ✓
 - **ML Kit OCR Module** — ✓
 - **File Export** — ✓
@@ -249,7 +250,23 @@ Expected result:
 - Row "Foreground Capture Service Running" updates to ✓
 - A **persistent ZenLens notification** appears in the Android status bar
 
-**Step 6 — Tap "Stop Capture Service"**
+**Step 6 — Tap "Test Single Frame Capture"**
+
+Button is enabled now that permission is granted and service is running.
+
+Expected result:
+- Button turns green — "Frame captured ✓ — 1080×2340" (your device resolution)
+- Width × height are your real screen dimensions
+- pixelFormat is shown (1 = RGBA_8888)
+- No image data crosses the JS bridge — metadata only
+
+What this proves:
+- VirtualDisplay was created from the active MediaProjection
+- ImageReader received at least one frame within 3 seconds
+- Image.close(), ImageReader.close(), VirtualDisplay.release() all completed safely
+- No continuous loop started — exactly one frame captured
+
+**Step 7 — Tap "Stop Capture Service"**
 
 Expected result:
 - Button turns green — "Service stopped ✓ — token cleared."
@@ -257,9 +274,9 @@ Expected result:
 - Row "Foreground Capture Service Running" goes back to ✗
 - Row "MediaProjection Permission Granted" goes back to ✗ (token consumed, Android 14+)
 
-**Step 7 — Checkpoint passed**
+**Step 8 — Checkpoint passed**
 
-If all three buttons show green in order, the foreground service handoff is **fully proven**:
+If all four buttons show green in order, the single-frame capture checkpoint is **fully proven**:
 
 ```
 ✓ Permission dialog appeared and was granted
@@ -267,11 +284,15 @@ If all three buttons show green in order, the foreground service handoff is **fu
 ✓ ScreenCaptureService received the grant via Intent extras
 ✓ startForeground() called — persistent notification visible
 ✓ MediaProjection object created and callback registered
+✓ VirtualDisplay created — screen content rendered to ImageReader surface
+✓ ImageReader delivered exactly one frame within 3 seconds
+✓ Frame metadata extracted: width, height, pixelFormat, timestamp
+✓ Image, ImageReader, VirtualDisplay, HandlerThread all released safely
 ✓ Service stopped cleanly — notification gone, token cleared
 ✓ Device Readiness rows report accurate live status
 ```
 
-Next build step: **single-frame capture via VirtualDisplay** — not OCR yet.
+Next build step: **crop-region frame capture**, then OCR.
 
 ---
 

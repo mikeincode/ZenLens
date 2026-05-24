@@ -146,7 +146,23 @@ export interface PermissionWiringStatus {
   requestCode: number;
   permissionGranted: boolean;
   serviceMethodsPresent: boolean;
+  singleFrameWiringPresent?: boolean;
 }
+
+export interface SingleFrameSuccess {
+  success: true;
+  width: number;
+  height: number;
+  pixelFormat: number;
+  timestamp: number;
+}
+
+export interface SingleFrameError {
+  success: false;
+  reason: string;
+}
+
+export type SingleFrameResult = SingleFrameSuccess | SingleFrameError;
 
 export interface PermissionResult {
   granted: boolean;
@@ -259,6 +275,31 @@ export async function getNativeCaptureServiceStatus(): Promise<CaptureServiceSta
     return await mod.getCaptureServiceStatus();
   } catch {
     return null;
+  }
+}
+
+// ─── Single-frame capture ─────────────────────────────────────────────────────
+
+/**
+ * Capture exactly one screen frame via VirtualDisplay + ImageReader in ScreenCaptureService.
+ *
+ * Requires:
+ *   - ScreenCaptureService to be running
+ *   - MediaProjection permission granted
+ *
+ * Returns null if the native module is unavailable (Expo Go / missing module).
+ * Returns { success: false, reason } if the service or permission is not ready.
+ * Returns { success: true, width, height, pixelFormat, timestamp } on success.
+ *
+ * Does NOT transfer image data over the bridge. Metadata only.
+ */
+export async function captureSingleNativeFrame(): Promise<SingleFrameResult | null> {
+  const mod = getNativeCaptureModule();
+  if (!mod || typeof mod.captureSingleFrame !== "function") return null;
+  try {
+    return await mod.captureSingleFrame();
+  } catch (e: any) {
+    return { success: false, reason: e?.message ?? "Unknown error during frame capture" };
   }
 }
 

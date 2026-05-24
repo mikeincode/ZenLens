@@ -97,6 +97,13 @@ const REQUIRED_KT = [
     "getParcelableExtra",
     "onDestroy",
     "Log.d",
+    "VirtualDisplay",
+    "ImageReader",
+    "doCaptureSingleFrame",
+    "FrameCaptureCallback",
+    "VirtualDisplay.release",
+    "imageReader?.close",
+    "CountDownLatch",
   ]},
   { file: "OverlayModule.kt", label: "OverlayModule", mustContain: ["SYSTEM_ALERT_WINDOW", "WindowManager"] },
   { file: "MLKitOCRModule.kt", label: "MLKitOCRModule", mustContain: ["TextRecognition", "recognizeText"] },
@@ -128,6 +135,20 @@ if (fs.existsSync(CAPTURE_MODULE_PATH)) {
   check("stopCaptureService() @ReactMethod", src.includes("fun stopCaptureService"), null);
   check("getCaptureServiceStatus() @ReactMethod", src.includes("fun getCaptureServiceStatus"), null);
   check("checkWiring() @ReactMethod", src.includes("fun checkWiring"), null);
+  check("captureSingleFrame() @ReactMethod", src.includes("fun captureSingleFrame"),
+    "Add captureSingleFrame @ReactMethod that delegates to ScreenCaptureService.captureSingleFrame()");
+  check("captureSingleFrame delegates to ScreenCaptureService",
+    src.includes("ScreenCaptureService.captureSingleFrame"),
+    "ScreenCaptureService.captureSingleFrame(callback) must be called from the module");
+  check("captureSingleFrame returns success map with width/height",
+    src.includes("putBoolean(\"success\", true)") && src.includes("putInt(\"width\""),
+    "captureSingleFrame must resolve with { success, width, height, pixelFormat, timestamp }");
+  check("captureSingleFrame returns error map with reason",
+    src.includes("putBoolean(\"success\", false)") && src.includes("putString(\"reason\""),
+    "captureSingleFrame must resolve with { success: false, reason } on failure");
+  check("checkWiring includes singleFrameWiringPresent",
+    src.includes("singleFrameWiringPresent"),
+    "Add putBoolean(\"singleFrameWiringPresent\", true) to checkWiring()");
   check("requestPermission returns map (not plain boolean)", src.includes("Arguments.createMap"),
     "requestPermission should resolve with WritableMap { granted, permissionCached, reason? }");
   check("startCaptureService passes resultCode + resultData to Intent",
@@ -188,9 +209,26 @@ if (fs.existsSync(CAPTURE_SERVICE_PATH)) {
   check("Log.d stage logging present", src.includes("Log.d("), null);
   check("Guards against null/invalid resultData before calling getMediaProjection",
     src.includes("resultCode != Activity.RESULT_OK") || src.includes("resultData == null"), null);
-
-  // STOP action handling
   check("STOP action handled in onStartCommand", src.includes("action == \"STOP\""), null);
+
+  // ── Single-frame capture checks ──────────────────────────────────────────────
+  check("companion object stores service instance", src.includes("instance: ScreenCaptureService"), null);
+  check("instance set in onCreate()", src.includes("instance = this"), null);
+  check("instance cleared in onDestroy()", src.includes("instance = null"), null);
+  check("FrameCaptureCallback interface declared", src.includes("interface FrameCaptureCallback"), null);
+  check("captureSingleFrame() static entry point", src.includes("fun captureSingleFrame(callback"), null);
+  check("doCaptureSingleFrame() private implementation", src.includes("fun doCaptureSingleFrame"), null);
+  check("ImageReader.newInstance() called", src.includes("ImageReader.newInstance("), null);
+  check("VirtualDisplay created via createVirtualDisplay", src.includes("createVirtualDisplay("), null);
+  check("HandlerThread used for ImageReader listener", src.includes("HandlerThread("), null);
+  check("CountDownLatch used for timeout", src.includes("CountDownLatch("), null);
+  check("CountDownLatch.await() with 3s timeout", src.includes("latch.await(3"), null);
+  check("Image.close() always called", src.includes("img?.close()"), null);
+  check("ImageReader.close() in releaseAll / cleanup", src.includes("imageReader?.close()"), null);
+  check("VirtualDisplay.release() in releaseAll / cleanup", src.includes("virtualDisplay?.release()"), null);
+  check("HandlerThread.quitSafely() called", src.includes("quitSafely()"), null);
+  check("RGBA_8888 pixel format used", src.includes("RGBA_8888"), null);
+  check("VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR used", src.includes("VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR"), null);
 }
 
 // ─── 6. AndroidManifest.xml ───────────────────────────────────────────────────
@@ -262,9 +300,16 @@ if (fs.existsSync(OCR_UTIL)) {
     "startNativeCaptureService",
     "stopNativeCaptureService",
     "getNativeCaptureServiceStatus",
+    "captureSingleNativeFrame",
   ]) { check(`export ${fn}()`, src.includes(fn), `Add async function ${fn}() to utils/ocr.ts`); }
   check("ZenLensCapture referenced", src.includes("ZenLensCapture"), null);
   check("ZenLensOCR referenced", src.includes("ZenLensOCR"), null);
+  check("SingleFrameResult type exported", src.includes("SingleFrameResult"), null);
+  check("SingleFrameSuccess interface declared", src.includes("SingleFrameSuccess"), null);
+  check("SingleFrameError interface declared", src.includes("SingleFrameError"), null);
+  check("captureSingleNativeFrame returns null on missing module",
+    src.includes("typeof mod.captureSingleFrame") || src.includes("captureSingleFrame"),
+    "Wrapper must check that captureSingleFrame exists before calling it");
 }
 
 // ─── 11. Device Readiness screen ─────────────────────────────────────────────
@@ -279,12 +324,16 @@ if (fs.existsSync(readinessPath)) {
     "permissionGranted",
     "serviceWiring",
     "serviceRunning",
+    "singleFrameWiring",
     "overlayModule",
     "ocrModule",
     "fileExport",
     "getNativeCaptureServiceStatus",
     "startNativeCaptureService",
     "stopNativeCaptureService",
+    "captureSingleNativeFrame",
+    "Test Single Frame Capture",
+    "handleTestSingleFrame",
   ]) { check(`readiness.tsx has '${token}'`, src.includes(token), null); }
 }
 
@@ -295,16 +344,17 @@ console.log(`Passed: ${passed}   Failed: ${failed}   Warnings: ${warnings}`);
 
 if (failed === 0) {
   console.log(`
-✓ All checks passed. Foreground service handoff is fully wired.
+✓ All checks passed. Single-frame capture checkpoint fully wired.
 
 Native APK test order:
-  1. npm run android:apk                    → build APK
-  2. adb install <apk>                      → install on device
-  3. Open ZenLens → Device Readiness        → all 8 rows green
-  4. Tap 'Test MediaProjection Permission'  → Android dialog appears → grant
-  5. Tap 'Test Foreground Capture Service'  → persistent notification visible
-  6. Tap 'Stop Capture Service'             → notification disappears, token cleared
-  7. If all pass → next step is single-frame capture (not OCR yet)
+  1.  npm run android:apk                    → build APK
+  2.  adb install <apk>                      → install on device
+  3.  Open ZenLens → Device Readiness        → all 9 rows green
+  4.  Tap 'Test MediaProjection Permission'  → Android dialog appears → grant
+  5.  Tap 'Test Foreground Capture Service'  → persistent notification visible
+  6.  Tap 'Test Single Frame Capture'        → frame metadata appears (width×height)
+  7.  Tap 'Stop Capture Service'             → notification disappears, token cleared
+  8.  If all pass → next step is crop-region capture, then OCR
 `);
   process.exit(0);
 } else {

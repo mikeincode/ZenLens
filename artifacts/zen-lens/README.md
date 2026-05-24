@@ -87,16 +87,21 @@ After installing on a **physical Android device**:
 2. Go to **Device Readiness**
 3. Confirm **ZenLensCapture module** row shows ✓
 4. Confirm **MediaProjection permission wiring** row shows ✓ (ActivityEventListener registered)
-5. Confirm **Foreground capture service wiring** row shows ✓ (all three methods present)
-6. Tap **Test MediaProjection Permission**
+5. Confirm **Foreground capture service wiring** row shows ✓ (all methods present)
+6. Confirm **Single-frame capture wiring** row shows ✓ (captureSingleFrame() available)
+7. Tap **Test MediaProjection Permission**
    — Android "Start recording?" dialog appears
    — Tap **Start now** → status shows "Granted ✓ — token cached"
-7. Tap **Test Foreground Capture Service**
+8. Tap **Test Foreground Capture Service**
    — Service starts → persistent **ZenLens notification** appears in the status bar
-8. Tap **Stop Capture Service**
-   — Notification disappears → token cleared → "Service stopped ✓"
-9. If all three buttons show green: **the foreground service handoff is proven**
-10. Next build step: **single-frame capture** via VirtualDisplay — not OCR yet
+9. Tap **Test Single Frame Capture**
+   — Waits up to 3 seconds for one frame via VirtualDisplay + ImageReader
+   — Status shows e.g. "Frame captured ✓ — 1080×2340" (your device resolution)
+   — Frame pipeline is proven — no OCR yet, metadata only
+10. Tap **Stop Capture Service**
+    — Notification disappears → token cleared → "Service stopped ✓"
+11. If all four buttons show green: **the single-frame capture checkpoint is proven**
+12. Next build step: **crop-region capture**, then OCR
 
 > **Android 14+ note:** The MediaProjection token is one-session-use.
 > After stop, a fresh **Test MediaProjection Permission** is required before

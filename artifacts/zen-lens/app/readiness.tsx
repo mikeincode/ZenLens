@@ -15,6 +15,7 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import {
+  captureSingleNativeFrame,
   checkPermissionWiring,
   getNativeCaptureServiceStatus,
   requestNativeMediaProjectionPermission,
@@ -22,6 +23,7 @@ import {
   stopNativeCaptureService,
   type PermissionWiringStatus,
   type CaptureServiceStatus,
+  type SingleFrameResult,
 } from "@/utils/ocr";
 import { useColors } from "@/hooks/useColors";
 
@@ -42,6 +44,7 @@ interface ReadinessState {
   permissionGranted: RowState;
   serviceWiring: RowState;
   serviceRunning: RowState;
+  singleFrameWiring: RowState;
   overlayModule: RowState;
   ocrModule: RowState;
   fileExport: RowState;
@@ -54,6 +57,7 @@ const init: ReadinessState = {
   permissionGranted: CHECKING,
   serviceWiring: CHECKING,
   serviceRunning: CHECKING,
+  singleFrameWiring: CHECKING,
   overlayModule: CHECKING,
   ocrModule: CHECKING,
   fileExport: CHECKING,
@@ -82,6 +86,9 @@ export default function ReadinessScreen() {
   const [svcMsg, setSvcMsg] = useState("");
   const [stopState, setStopState] = useState<"idle" | "busy" | "ok" | "err">("idle");
   const [stopMsg, setStopMsg] = useState("");
+  const [frameState, setFrameState] = useState<"idle" | "busy" | "ok" | "err">("idle");
+  const [frameMsg, setFrameMsg] = useState("");
+  const [lastFrameResult, setLastFrameResult] = useState<SingleFrameResult | null>(null);
   const [permGranted, setPermGranted] = useState(false);
   const [svcRunning, setSvcRunning] = useState(false);
 
@@ -186,6 +193,15 @@ export default function ReadinessScreen() {
         }));
       }
 
+      // ── 3b. Single-frame capture wiring ────────────────────────────────────
+      const hasSingleFrame = typeof captureModule.captureSingleFrame === "function";
+      setRows((p) => ({
+        ...p,
+        singleFrameWiring: hasSingleFrame
+          ? { status: "ok", detail: "captureSingleFrame() available — VirtualDisplay + ImageReader pipeline wired." }
+          : { status: "warn", detail: "captureSingleFrame() missing — rebuild APK with updated ScreenCaptureModule.kt." },
+      }));
+
       // ── 4. Live permission + service status ────────────────────────────────
       const liveStatus: CaptureServiceStatus | null = await getNativeCaptureServiceStatus();
       if (liveStatus) {
@@ -288,6 +304,25 @@ export default function ReadinessScreen() {
     }
   }
 
+  async function handleTestSingleFrame() {
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setFrameState("busy"); setFrameMsg(""); setLastFrameResult(null);
+    const result = await captureSingleNativeFrame();
+    if (!result) {
+      setFrameState("err");
+      setFrameMsg("captureSingleFrame() not available — rebuild APK with updated ScreenCaptureModule.kt.");
+      return;
+    }
+    setLastFrameResult(result);
+    if (result.success) {
+      setFrameState("ok");
+      setFrameMsg(`Frame captured ✓ — ${result.width}×${result.height} · format=${result.pixelFormat}`);
+    } else {
+      setFrameState("err");
+      setFrameMsg(result.reason);
+    }
+  }
+
   function btnColor(s: "idle" | "busy" | "ok" | "err") {
     return s === "ok" ? colors.success : s === "err" ? colors.destructive : colors.accent;
   }
@@ -324,6 +359,12 @@ export default function ReadinessScreen() {
       title: "Foreground Capture Service Running",
       desc: "ScreenCaptureService is active — persistent notification visible.",
       icon: "activity",
+    },
+    {
+      key: "singleFrameWiring" as const,
+      title: "Single-Frame Capture Wiring",
+      desc: "captureSingleFrame() exposed — VirtualDisplay + ImageReader pipeline ready.",
+      icon: "camera",
     },
     {
       key: "overlayModule" as const,
@@ -473,8 +514,8 @@ export default function ReadinessScreen() {
           </Text>
           <Text style={[styles.testHint, { color: colors.mutedForeground }]}>
             {isExpoGo
-              ? "All three tests require a native APK build."
-              : "Run in order: grant permission → start service → stop service. If all three pass, the handoff is proven."}
+              ? "All four tests require a native APK build."
+              : "Run in order: grant permission → start service → test single frame → stop service."}
           </Text>
 
           {/* Permission */}
@@ -518,6 +559,35 @@ export default function ReadinessScreen() {
               <Text style={[styles.testBtnSub, { color: svcMsg ? btnColor(svcState) : colors.mutedForeground }]}>
                 {svcMsg || (permGranted ? "Starts ScreenCaptureService — check notification bar" : "Grant permission first")}
               </Text>
+            </View>
+          </Pressable>
+
+          {/* Single frame capture */}
+          <Pressable
+            onPress={handleTestSingleFrame}
+            disabled={frameState === "busy" || ((!permGranted || !svcRunning) && !isExpoGo)}
+            style={({ pressed }) => [
+              styles.testBtn,
+              {
+                backgroundColor: frameState === "ok" ? `${colors.success}14` : frameState === "err" ? `${colors.destructive}14` : `${colors.primary}14`,
+                borderColor: frameState === "ok" ? `${colors.success}44` : frameState === "err" ? `${colors.destructive}44` : `${colors.primary}44`,
+                opacity: frameState === "busy" || ((!permGranted || !svcRunning) && !isExpoGo) || pressed ? 0.45 : 1,
+              },
+            ]}
+          >
+            {frameState === "busy" ? <ActivityIndicator size="small" color={colors.primary} /> : <Feather name="camera" size={15} color={btnColor(frameState)} />}
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.testBtnLabel, { color: btnColor(frameState) }]}>Test Single Frame Capture</Text>
+              <Text style={[styles.testBtnSub, { color: frameMsg ? btnColor(frameState) : colors.mutedForeground }]}>
+                {frameMsg || (svcRunning
+                  ? "Captures one frame via VirtualDisplay + ImageReader — metadata only"
+                  : "Grant permission and start service first")}
+              </Text>
+              {lastFrameResult?.success && (
+                <Text style={[styles.testBtnSub, { color: colors.success, marginTop: 2 }]}>
+                  {`${lastFrameResult.width}×${lastFrameResult.height} · pixelFormat=${lastFrameResult.pixelFormat}`}
+                </Text>
+              )}
             </View>
           </Pressable>
 

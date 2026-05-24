@@ -17,6 +17,7 @@ import { StatusPill } from "@/components/StatusPill";
 import { useCapture } from "@/context/CaptureContext";
 import { useColors } from "@/hooks/useColors";
 import {
+  captureSingleNativeFrame,
   requestNativeMediaProjectionPermission,
   startNativeCaptureService,
   stopNativeCaptureService,
@@ -33,6 +34,8 @@ interface NativeTestState {
   permissionMsg: string;
   service: TestState;
   serviceMsg: string;
+  frame: TestState;
+  frameMsg: string;
   stop: TestState;
   stopMsg: string;
   permissionGranted: boolean;
@@ -44,6 +47,8 @@ const INIT: NativeTestState = {
   permissionMsg: "",
   service: "idle",
   serviceMsg: "",
+  frame: "idle",
+  frameMsg: "",
   stop: "idle",
   stopMsg: "",
   permissionGranted: false,
@@ -153,6 +158,33 @@ export default function HomeScreen() {
     }
   }
 
+  async function handleTestSingleFrame() {
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setNt((p) => ({ ...p, frame: "busy", frameMsg: "" }));
+    const result = await captureSingleNativeFrame();
+    if (!result) {
+      setNt((p) => ({
+        ...p,
+        frame: "err",
+        frameMsg: "captureSingleFrame() unavailable — rebuild APK.",
+      }));
+      return;
+    }
+    if (result.success) {
+      setNt((p) => ({
+        ...p,
+        frame: "ok",
+        frameMsg: `Frame captured ✓ — ${result.width}×${result.height}`,
+      }));
+    } else {
+      setNt((p) => ({
+        ...p,
+        frame: "err",
+        frameMsg: result.reason,
+      }));
+    }
+  }
+
   async function handleStopService() {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     setNt((p) => ({ ...p, stop: "busy", stopMsg: "" }));
@@ -176,6 +208,8 @@ export default function HomeScreen() {
         permissionMsg: "",
         service: "idle",
         serviceMsg: "",
+        frame: "idle",
+        frameMsg: "",
       }));
     } else {
       setNt((p) => ({ ...p, stop: "err", stopMsg: "Stop returned false — check logs." }));
@@ -434,7 +468,46 @@ export default function HomeScreen() {
             </View>
           </Pressable>
 
-          {/* Button 3: Stop service */}
+          {/* Button 3: Single frame capture */}
+          <Pressable
+            onPress={handleTestSingleFrame}
+            disabled={nt.frame === "busy" || ((!nt.permissionGranted || !nt.serviceRunning) && !isExpoGo)}
+            style={({ pressed }) => [
+              styles.nativeBtn,
+              {
+                backgroundColor: testBg(nt.frame),
+                borderColor: testBorder(nt.frame),
+                opacity:
+                  nt.frame === "busy" ||
+                  ((!nt.permissionGranted || !nt.serviceRunning) && !isExpoGo) ||
+                  pressed
+                    ? 0.45
+                    : 1,
+              },
+            ]}
+          >
+            {nt.frame === "busy"
+              ? <ActivityIndicator size="small" color={colors.accent} />
+              : <Feather name="camera" size={15} color={testColor(nt.frame)} />}
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.nativeBtnLabel, { color: testColor(nt.frame) }]}>
+                Test Single Frame Capture
+              </Text>
+              {nt.frameMsg ? (
+                <Text style={[styles.nativeBtnSub, { color: testColor(nt.frame) }]}>
+                  {nt.frameMsg}
+                </Text>
+              ) : (
+                <Text style={[styles.nativeBtnSub, { color: colors.mutedForeground }]}>
+                  {nt.serviceRunning
+                    ? "Captures one frame — returns width×height metadata"
+                    : "Start service first (button above)"}
+                </Text>
+              )}
+            </View>
+          </Pressable>
+
+          {/* Button 4: Stop service */}
           <Pressable
             onPress={handleStopService}
             disabled={nt.stop === "busy" || (!nt.serviceRunning && !isExpoGo)}

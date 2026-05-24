@@ -3,30 +3,14 @@ package com.zenlens.app
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.PixelFormat
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
-import android.media.Image
-import android.media.ImageReader
-import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
 import android.os.Build
-import android.util.Base64
-import android.util.DisplayMetrics
 import android.util.Log
-import android.view.WindowManager
 import com.facebook.react.bridge.*
-import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
 
 private const val TAG = "ZenLensCapture"
 
 /**
  * ScreenCaptureModule — NativeModules.ZenLensCapture
- *
- * Checkpoint: foreground service handoff.
- * Frame capture (VirtualDisplay / ImageReader) is intentionally not yet activated.
  *
  * JS API:
  *
@@ -43,7 +27,14 @@ private const val TAG = "ZenLensCapture"
  *     → { permissionGranted: boolean, serviceRunning: boolean, hasProjectionToken: boolean }
  *
  *   checkWiring()
- *     → { activityListenerRegistered: boolean, requestCode: number, permissionGranted: boolean }
+ *     → { activityListenerRegistered: boolean, requestCode: number,
+ *          permissionGranted: boolean, serviceMethodsPresent: boolean,
+ *          singleFrameWiringPresent: boolean }
+ *
+ *   captureSingleFrame()
+ *     → { success: true, width: number, height: number,
+ *          pixelFormat: number, timestamp: number }
+ *       | { success: false, reason: string }
  *
  *   requestOverlayPermission() → boolean
  */
@@ -57,7 +48,7 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
 
     // ── State ─────────────────────────────────────────────────────────────────
 
-    private var mediaProjectionManager: MediaProjectionManager? = null
+    private var mediaProjectionManager: android.media.projection.MediaProjectionManager? = null
 
     /** Pending JS promise from requestPermission(). Resolved in onMediaProjectionResult(). */
     private var permissionPromise: Promise? = null
@@ -160,7 +151,7 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
 
         mediaProjectionManager = activity.getSystemService(
             Context.MEDIA_PROJECTION_SERVICE
-        ) as MediaProjectionManager
+        ) as android.media.projection.MediaProjectionManager
 
         permissionPromise = promise
         resultHandled = false
@@ -175,9 +166,6 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
     /**
      * Starts ScreenCaptureService with the stored MediaProjection grant.
      * Returns { started: boolean, reason?: string }.
-     *
-     * Fails clearly if permission has not been granted yet.
-     * After stop, Android 14+ invalidates the token — must call requestPermission() again.
      */
     @ReactMethod
     fun startCaptureService(promise: Promise) {
@@ -285,9 +273,77 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
             putBoolean("activityListenerRegistered", activityListenerRegistered)
             putInt("requestCode", MEDIA_PROJECTION_REQUEST)
             putBoolean("permissionGranted", pendingResultCode == Activity.RESULT_OK && pendingResultData != null)
-            putBoolean("serviceMethodsPresent", true)  // Always true if this module version is loaded
+            putBoolean("serviceMethodsPresent", true)
+            putBoolean("singleFrameWiringPresent", true)
         }
         promise.resolve(result)
+    }
+
+    // ── @ReactMethod: captureSingleFrame ──────────────────────────────────────
+
+    /**
+     * Capture exactly one screen frame via VirtualDisplay + ImageReader in ScreenCaptureService.
+     *
+     * Requires:
+     *   - ScreenCaptureService to be running (isRunning = true)
+     *   - MediaProjection permission to have been granted
+     *
+     * Returns:
+     *   { success: true, width, height, pixelFormat, timestamp }
+     *   { success: false, reason: string }
+     *
+     * Does NOT:
+     *   - Start a continuous capture loop
+     *   - Run OCR
+     *   - Send base64 image data over the bridge
+     *   - Modify service state
+     */
+    @ReactMethod
+    fun captureSingleFrame(promise: Promise) {
+        if (!ScreenCaptureService.isRunning) {
+            val err = Arguments.createMap().apply {
+                putBoolean("success", false)
+                putString("reason", "Capture service is not running — start it first")
+            }
+            promise.resolve(err)
+            return
+        }
+
+        if (pendingResultCode != Activity.RESULT_OK || pendingResultData == null) {
+            val err = Arguments.createMap().apply {
+                putBoolean("success", false)
+                putString("reason", "MediaProjection permission not granted")
+            }
+            promise.resolve(err)
+            return
+        }
+
+        Log.d(TAG, "captureSingleFrame: delegating to ScreenCaptureService")
+
+        // Runs on RN background thread — blocks up to 3 s inside doCaptureSingleFrame
+        ScreenCaptureService.captureSingleFrame(object : ScreenCaptureService.FrameCaptureCallback {
+            override fun onSuccess(width: Int, height: Int, pixelFormat: Int, timestamp: Long) {
+                Log.d(TAG, "captureSingleFrame: success ${width}x${height} format=$pixelFormat")
+                val result = Arguments.createMap().apply {
+                    putBoolean("success", true)
+                    putInt("width", width)
+                    putInt("height", height)
+                    putInt("pixelFormat", pixelFormat)
+                    // JS bridge doesn't support Long directly — use Double (safe for timestamps)
+                    putDouble("timestamp", timestamp.toDouble())
+                }
+                promise.resolve(result)
+            }
+
+            override fun onError(reason: String) {
+                Log.e(TAG, "captureSingleFrame: error — $reason")
+                val err = Arguments.createMap().apply {
+                    putBoolean("success", false)
+                    putString("reason", reason)
+                }
+                promise.resolve(err)
+            }
+        })
     }
 
     // ── @ReactMethod: requestOverlayPermission ────────────────────────────────
@@ -314,31 +370,21 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // ── Legacy frame capture methods (kept for CaptureContext compatibility) ───
-    // These will be wired to VirtualDisplay in the next checkpoint (single-frame capture).
-
-    private var virtualDisplay: VirtualDisplay? = null
-    private var imageReader: ImageReader? = null
-    private var screenWidth = 0
-    private var screenHeight = 0
-    private var screenDensity = 0
-    private var cropX = 0; private var cropY = 0
-    private var cropWidth = 800; private var cropHeight = 600
+    // ── Legacy frame capture stubs (kept for CaptureContext compatibility) ────
+    // Not yet wired — continuous capture is a future checkpoint.
 
     @ReactMethod
     fun startCapture(x: Int, y: Int, width: Int, height: Int, promise: Promise) {
-        // Next checkpoint: wire to VirtualDisplay using ScreenCaptureService.getMediaProjection()
-        promise.reject("NOT_IMPLEMENTED", "Frame capture not yet implemented — use startCaptureService() for this checkpoint")
+        promise.reject("NOT_IMPLEMENTED", "Continuous frame capture not yet implemented — use captureSingleFrame() for this checkpoint")
     }
 
     @ReactMethod
     fun captureFrame(promise: Promise) {
-        promise.reject("NOT_IMPLEMENTED", "Frame capture not yet implemented — complete foreground service handoff first")
+        promise.reject("NOT_IMPLEMENTED", "Use captureSingleFrame() for the current checkpoint")
     }
 
     @ReactMethod
     fun stopCapture(promise: Promise) {
-        // Delegate to the service-based stop
         stopCaptureService(promise)
     }
 
