@@ -96,6 +96,7 @@ export function CaptureProvider({ children }: { children: React.ReactNode }) {
   const transcriptRef = useRef(transcript);
   const cropRectRef = useRef(cropRect);
   const settingsRef = useRef(settings);
+  const mediaProjectionPermissionRef = useRef<PermissionStatus>("unknown");
 
   useEffect(() => {
     transcriptRef.current = transcript;
@@ -108,6 +109,10 @@ export function CaptureProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     settingsRef.current = settings;
   }, [settings]);
+
+  useEffect(() => {
+    mediaProjectionPermissionRef.current = mediaProjectionPermission;
+  }, [mediaProjectionPermission]);
 
   // Load persisted data on mount
   useEffect(() => {
@@ -192,7 +197,8 @@ export function CaptureProvider({ children }: { children: React.ReactNode }) {
   const startCapture = useCallback(async () => {
     if (mediaProjectionPermission !== "granted") {
       await requestPermissions();
-      if (mediaProjectionPermission !== "granted") return;
+      // Use ref to read the current value — state is stale inside this closure.
+      if (mediaProjectionPermissionRef.current !== "granted") return;
     }
     resetSimulation();
     clearDedupeHistory();
