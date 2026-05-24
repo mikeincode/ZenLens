@@ -273,18 +273,27 @@ if (!fs.existsSync(MAIN_ACTIVITY_PATH)) {
   }
 }
 
-// ─── Step 5: ML Kit dependency note ──────────────────────────────────────────
+// ─── Step 5: Patch android/app/build.gradle — ML Kit dependency ──────────────
 
 section("ML Kit dependency");
 
+const MLKIT_DEP = 'implementation "com.google.mlkit:text-recognition:16.0.1"';
+const MLKIT_COMMENT = "// ZenLens: Google ML Kit on-device text recognition";
+
 const buildGradlePath = path.join(ANDROID_ROOT, "app", "build.gradle");
-if (fs.existsSync(buildGradlePath)) {
-  const buildGradle = fs.readFileSync(buildGradlePath, "utf8");
+if (!fs.existsSync(buildGradlePath)) {
+  warn("android/app/build.gradle not found — run android:prebuild first");
+} else {
+  let buildGradle = fs.readFileSync(buildGradlePath, "utf8");
   if (buildGradle.includes("text-recognition")) {
     ok("ML Kit text-recognition already in android/app/build.gradle");
   } else {
-    warn("ML Kit text-recognition NOT found in android/app/build.gradle");
-    warn('Add to dependencies block: implementation "com.google.mlkit:text-recognition:16.0.1"');
+    buildGradle = buildGradle.replace(
+      /implementation\("com\.facebook\.react:react-android"\)/,
+      `implementation("com.facebook.react:react-android")\n\n    ${MLKIT_COMMENT}\n    ${MLKIT_DEP}`
+    );
+    fs.writeFileSync(buildGradlePath, buildGradle, "utf8");
+    ok("Injected ML Kit text-recognition into android/app/build.gradle");
   }
 }
 

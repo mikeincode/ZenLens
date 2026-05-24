@@ -266,12 +266,50 @@ function withPatchMainActivity(config) {
   ]);
 }
 
-// ─── Compose all four steps ──────────────────────────────────────────────────
+// ─── Step 5: Patch android/app/build.gradle — ML Kit dependency ──────────────
+
+const MLKIT_DEP = 'implementation "com.google.mlkit:text-recognition:16.0.1"';
+const MLKIT_COMMENT = "// ZenLens: Google ML Kit on-device text recognition";
+
+function withMlKitDependency(config) {
+  return withDangerousMod(config, [
+    "android",
+    (cfg) => {
+      const projectRoot = cfg.modRequest.projectRoot;
+      const buildGradlePath = path.join(projectRoot, "android", "app", "build.gradle");
+
+      if (!fs.existsSync(buildGradlePath)) {
+        console.warn("[ZenLens] android/app/build.gradle not found — skipping ML Kit injection.");
+        return cfg;
+      }
+
+      let src = fs.readFileSync(buildGradlePath, "utf8");
+
+      if (src.includes("text-recognition")) {
+        console.log("[ZenLens] ML Kit text-recognition already in build.gradle — skipping.");
+        return cfg;
+      }
+
+      // Insert after the first `implementation("com.facebook.react:react-android")` line
+      src = src.replace(
+        /implementation\("com\.facebook\.react:react-android"\)/,
+        `implementation("com.facebook.react:react-android")\n\n    ${MLKIT_COMMENT}\n    ${MLKIT_DEP}`
+      );
+
+      fs.writeFileSync(buildGradlePath, src, "utf8");
+      console.log("[ZenLens] Injected ML Kit text-recognition into android/app/build.gradle");
+      return cfg;
+    },
+  ]);
+}
+
+// ─── Compose all five steps ───────────────────────────────────────────────────
 
 module.exports = function withZenLensNativeModules(config) {
   config = withCopyKotlinModules(config);
   config = withAndroidPermissionsAndService(config);
   config = withRegisterZenLensPackage(config);
   config = withPatchMainActivity(config);
+  config = withMlKitDependency(config);
   return config;
 };
