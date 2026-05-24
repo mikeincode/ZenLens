@@ -139,6 +139,34 @@ export function isNativeAvailable(): boolean {
   return mod !== null;
 }
 
+export interface PermissionWiringStatus {
+  /** Module registered and ActivityEventListener wired (always true if native build) */
+  activityListenerRegistered: boolean;
+  /** MEDIA_PROJECTION_REQUEST constant from the module */
+  requestCode: number;
+  /** Whether MediaProjection permission is currently held */
+  permissionGranted: boolean;
+}
+
+/**
+ * Calls ScreenCaptureModule.checkWiring() to verify the full MediaProjection
+ * permission flow is wired — ActivityEventListener registered, request code
+ * constant present, and whether permission is currently held.
+ *
+ * Returns null in Expo Go (module not available).
+ */
+export async function checkPermissionWiring(): Promise<PermissionWiringStatus | null> {
+  const mod = getNativeCaptureModule();
+  if (!mod) return null;
+  // checkWiring is only present in the updated module
+  if (typeof mod.checkWiring !== "function") return null;
+  try {
+    return await mod.checkWiring();
+  } catch {
+    return null;
+  }
+}
+
 export async function requestMediaProjectionPermission(): Promise<boolean> {
   if (isNativeAvailable()) {
     try {

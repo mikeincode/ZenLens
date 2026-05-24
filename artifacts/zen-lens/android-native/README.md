@@ -1,8 +1,8 @@
 # ZenLens — Android Native Modules
 
-This folder contains the native Android (Kotlin) modules required for real screen capture,
-floating overlay, and on-device OCR. These modules **cannot run in Expo Go** — they require
-a custom development build or a production APK.
+This folder contains the native Android (Kotlin) modules for real screen capture,
+floating overlay, and on-device OCR.  **These modules cannot run in Expo Go** — a
+custom development build or production APK is required.
 
 ---
 
@@ -11,289 +11,256 @@ a custom development build or a production APK.
 | Module | JS Name | Purpose |
 |---|---|---|
 | `ScreenCaptureModule.kt` | `NativeModules.ZenLensCapture` | MediaProjection screen capture + frame crop |
-| `ScreenCaptureService.kt` | — | Foreground service (Android requirement for screen capture) |
+| `ScreenCaptureService.kt` | — | Foreground service (Android requirement for screen capture API 29+) |
 | `OverlayModule.kt` | `NativeModules.ZenLensOverlay` | SYSTEM_ALERT_WINDOW floating control |
-| `MLKitOCRModule.kt` | `NativeModules.ZenLensOCR` | Google ML Kit text recognition (on-device) |
-| `ZenLensPackage.kt` | — | ReactPackage that registers all four modules |
+| `MLKitOCRModule.kt` | `NativeModules.ZenLensOCR` | Google ML Kit text recognition (on-device, no network) |
+| `ZenLensPackage.kt` | — | ReactPackage that registers all four modules with the RN bridge |
 
 ---
 
-## Quick-check: Are native modules loaded?
+## MediaProjection Permission Flow
 
-In the running app: **Home → Device Readiness** shows a live checklist of which
-`NativeModules.*` keys are registered. All four must show ✓ for real capture to work.
+This is the most critical integration point.  The flow looks like:
+
+```
+JS: ZenLensCapture.requestPermission()
+        │
+        ▼
+ScreenCaptureModule.requestPermission()
+  · Gets MediaProjectionManager from activity
+  · Stores the JS Promise in permissionPromise
+  · Calls activity.startActivityForResult(createScreenCaptureIntent(), 1001)
+        │
+        ▼ Android shows "Start recording?" system dialog
+        │
+        ├─► User taps "Start now" (RESULT_OK)
+        │         │
+        │         ▼
+        │   TWO PATHS deliver the result (belt-and-suspenders):
+        │
+        │   PRIMARY — ActivityEventListener
+        │     React Native automatically calls
+        │     ScreenCaptureModule.onActivityResult(activity, 1001, RESULT_OK, data)
+        │     because the module registered itself via
+        │     reactContext.addActivityEventListener(this) in its init block.
+        │
+        │   SECONDARY — MainActivity explicit forward (config plugin patch)
+        │     MainActivity.onActivityResult(1001, RESULT_OK, data) is called by Android.
+        │     The patched override calls:
+        │       reactInstanceManager?.currentReactContext
+        │         ?.getNativeModule(ScreenCaptureModule::class.java)
+        │         ?.onMediaProjectionResult(resultCode, data)
+        │
+        │   DEDUPLICATION — onMediaProjectionResult() has a resultHandled guard.
+        │     The first caller wins; the second is a no-op.  Both paths can fire
+        │     without causing double-resolution of the JS Promise.
+        │
+        ├─► User taps "Cancel" (RESULT_CANCELED)
+        │         │
+        │         ▼
+        │   Same two paths deliver the result.
+        │   permissionPromise?.resolve(false) is called.
+        │   JS receives: false
+        │
+        ▼
+ScreenCaptureModule.onMediaProjectionResult(resultCode, data):
+  · Checks resultHandled guard (prevents double-invocation)
+  · If RESULT_OK: calls mediaProjectionManager.getMediaProjection(resultCode, data)
+  · Stores mediaProjection object (used by startCapture())
+  · Resolves permissionPromise with true/false
+```
+
+### Why not the modern Activity Result API?
+
+The modern `ActivityResultLauncher` (AndroidX Activity Result API) requires registering
+a launcher during `onCreate` — before the activity resumes.  React Native native modules
+receive their `currentActivity` reference lazily, after the activity has already started,
+so they cannot call `registerForActivityResult()` on it.
+
+`ActivityEventListener` is the idiomatic React Native solution.  It is:
+- Built into the RN bridge (`ReactContext.addActivityEventListener`)
+- Used by dozens of major RN packages (react-native-camera, react-native-image-picker, etc.)
+- Compatible with both old and new architecture
+- Zero MainActivity modifications needed for the primary path
+
+The explicit MainActivity forward is belt-and-suspenders only.
+
+---
+
+## What Expo Go Cannot Do
+
+| Feature | Why it fails in Expo Go |
+|---|---|
+| `NativeModules.ZenLensCapture` | Native Kotlin modules are not bundled in the Expo Go client |
+| MediaProjection permission dialog | `startActivityForResult` for `MediaProjectionManager` requires a native build |
+| SYSTEM_ALERT_WINDOW overlay | Custom overlay windows require `SYSTEM_ALERT_WINDOW` permission, not grantable in Expo Go |
+| ML Kit OCR | Native ML Kit SDK is not bundled in Expo Go |
+| Foreground service | Cannot start `ScreenCaptureService` without the native module |
+
+ZenLens detects Expo Go via `Constants.appOwnership === "expo"` and falls back to
+**simulation mode** — progressive sample text scrolls through the transcript, exercising
+all dedupe, export, and UI logic identically to a native build.
 
 ---
 
 ## Integration Steps
 
-### Step 1 — Prebuild (eject to bare workflow)
-
-Native modules require a custom `android/` directory. Generate it once:
+### Automated (recommended)
 
 ```bash
-cd artifacts/zen-lens
-npx expo prebuild --platform android --clean
+# From artifacts/zen-lens/
+npm run android:prebuild       # Expo prebuild runs the config plugin automatically
+npm run android:verify-native  # Confirm all modules and wiring are in place
+npm run android:apk            # Build APK via EAS
 ```
 
-This creates `android/` alongside `app/`. Do **not** run this again unless you want to
-regenerate and lose manual edits to the `android/` folder.
+The config plugin (`plugins/withZenLensNativeModules.js`) does all four steps:
+1. Copies all 5 `.kt` files from `android-native/` into the Android source tree
+2. Patches `AndroidManifest.xml` with permissions and service declaration
+3. Registers `ZenLensPackage` in `MainApplication.kt`
+4. Patches `MainActivity.kt` with the belt-and-suspenders `onActivityResult` forward
 
----
+Each step is idempotent — running prebuild multiple times will not duplicate anything.
 
-### Step 2 — Copy Kotlin files
+### Manual (fallback)
 
-After prebuild, copy all five `.kt` files from this folder into the generated Android source tree:
+If you are building with Android Studio and already have an `android/` directory:
 
-```
-android/app/src/main/java/com/zenlens/app/
-├── ScreenCaptureModule.kt
-├── ScreenCaptureService.kt
-├── OverlayModule.kt
-├── MLKitOCRModule.kt
-└── ZenLensPackage.kt
-```
-
-The package name at the top of each file (`package com.zenlens.app`) must match
-the `android.package` value in `app.json`. If you changed the package name during
-prebuild, update the `package` declaration in all five `.kt` files to match.
-
----
-
-### Step 3 — Register ZenLensPackage
-
-Open `android/app/src/main/java/com/zenlens/app/MainApplication.kt` and add
-the package to `getPackages()`:
-
-```kotlin
-import com.zenlens.app.ZenLensPackage  // add this import
-
-override fun getPackages(): List<ReactPackage> =
-    PackageList(this).packages.apply {
-        add(ZenLensPackage())            // add this line
-    }
+```bash
+npm run android:sync-native    # copies Kotlin files + patches manifests
+npm run android:verify-native  # check everything is in place
 ```
 
----
+Then add ML Kit manually (not done by the sync script):
 
-### Step 4 — Add ML Kit dependency
-
-Open `android/app/build.gradle` and add to the `dependencies` block:
-
-```groovy
+```gradle
+// android/app/build.gradle
 dependencies {
-    // ... existing entries ...
-
-    // ML Kit text recognition (on-device, no network)
-    implementation 'com.google.mlkit:text-recognition:16.0.1'
+    implementation "com.google.mlkit:text-recognition:16.0.1"
 }
 ```
 
-To bundle the model in the APK (eliminates first-run ~4 MB download):
-
-```groovy
-apply plugin: 'com.google.mlkit.vision.textrecognition'
-```
-
 ---
 
-### Step 5 — Update AndroidManifest.xml
-
-Open `android/app/src/main/AndroidManifest.xml` and add inside `<manifest>`:
+## Required AndroidManifest.xml Entries
 
 ```xml
-<!-- Screen capture / foreground service -->
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
-
-<!-- System overlay (floating control while ZenLens runs in background) -->
 <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
-
-<!-- Notifications — required for foreground service on Android 13+ -->
 <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>
+<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
 
-<!-- File export (legacy external storage, API ≤ 28/32 only) -->
-<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-    android:maxSdkVersion="28"/>
-<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
-    android:maxSdkVersion="32"/>
+<application ...>
+    <service
+        android:name=".ScreenCaptureService"
+        android:foregroundServiceType="mediaProjection"
+        android:exported="false"/>
+</application>
 ```
 
-Inside the `<application>` block, declare the foreground service:
-
-```xml
-<service
-    android:name=".ScreenCaptureService"
-    android:foregroundServiceType="mediaProjection"
-    android:exported="false"/>
-```
-
-> `foregroundServiceType="mediaProjection"` is **required** on API 29+. Without it,
-> Android will crash the service on start with a `MissingForegroundServiceTypeException`.
+`foregroundServiceType="mediaProjection"` is **required on API 29+**.  Without it,
+`startForegroundService()` will throw a `MissingForegroundServiceTypeException` on Android 14+.
 
 ---
 
-### Step 6 — Handle MediaProjection result in MainActivity
-
-The system delivers the MediaProjection grant back through `onActivityResult`.
-Open `android/app/src/main/java/com/zenlens/app/MainActivity.kt`:
+## Required MainApplication.kt Addition
 
 ```kotlin
-import android.content.Intent
-import com.zenlens.app.ScreenCaptureModule
+override fun getPackages(): List<ReactPackage> =
+    PackageList(this).packages.apply {
+        add(ZenLensPackage())   // ← added by config plugin / sync script
+    }
+```
 
-class MainActivity : ReactActivity() {
-    // ... existing code ...
+---
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == ScreenCaptureModule.MEDIA_PROJECTION_REQUEST) {
-            reactInstanceManager
-                .currentReactContext
-                ?.getNativeModule(ScreenCaptureModule::class.java)
-                ?.handlePermissionResult(resultCode, data)
-        }
+## Required MainActivity.kt Addition (belt-and-suspenders)
+
+```kotlin
+import android.content.Intent                          // add if missing
+import com.zenlens.app.ScreenCaptureModule             // add if missing
+
+// ZENLENS_ACTIVITY_RESULT_PATCH
+// Belt-and-suspenders: forward MediaProjection results to ScreenCaptureModule.
+// ScreenCaptureModule also implements ActivityEventListener (primary path).
+// onMediaProjectionResult() is idempotent — double-invocation is safe.
+override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+    super.onActivityResult(requestCode, resultCode, data)
+    if (requestCode == ScreenCaptureModule.MEDIA_PROJECTION_REQUEST) {
+        reactInstanceManager
+            ?.currentReactContext
+            ?.getNativeModule(ScreenCaptureModule::class.java)
+            ?.onMediaProjectionResult(resultCode, data)
     }
 }
 ```
 
----
-
-### Step 7 — minSdkVersion
-
-In `android/build.gradle` (root), ensure:
-
-```groovy
-buildscript {
-    ext {
-        minSdkVersion = 21   // MediaProjection requires API 21+
-        targetSdkVersion = 34
-    }
-}
-```
+The `// ZENLENS_ACTIVITY_RESULT_PATCH` sentinel is used by the config plugin and sync
+script to detect whether this block has already been injected.  If you add it manually,
+keep the sentinel comment so the scripts remain idempotent.
 
 ---
 
-## Building and Running
+## Testing Native Capture Test on Device
 
-### Development build — run directly on a connected Android device
+1. Install the APK on a physical Android device (emulators cannot use MediaProjection)
+2. Open ZenLens → tap **Device Readiness** on the home screen
+3. Verify the checklist:
+   - **ZenLensCapture Module** — ✓ (module registered)
+   - **ML Kit OCR Module** — ✓
+   - **System Overlay Module** — ✓
+   - **File Export** — ✓
+   - **MediaProjection Permission Wiring** — ✓ with "Wired ✓ — ActivityEventListener registered"
+4. Tap **Test MediaProjection Permission**
+5. Android displays a system dialog: **"ZenLens will start capturing everything that's displayed on your screen"**
+6. Tap **Start now** → the button changes to "Permission granted — native capture ready ✓"
+7. The wiring row updates to show `permissionGranted=true`
 
-```bash
-# From the artifacts/zen-lens directory:
-npx expo run:android
+### What success looks like
+
+```
+✓ All 4 module rows show ✓
+✓ MediaProjection Permission Wiring shows: "Wired ✓ — ActivityEventListener registered, requestCode 1001"
+✓ Native Capture Test shows: "Permission granted — native capture ready ✓"
+✓ Wiring row updates to: "Wired ✓ — permission already granted for this session"
 ```
 
-This builds a debug APK and installs it on any connected device (via USB, with
-USB debugging enabled). It opens a Metro bundler connection so JS hot reloads still work.
+### What failure looks like and what to do
 
-### Development APK — install without a computer (shareable debug build)
-
-```bash
-cd android
-./gradlew assembleDebug
-# Output: android/app/build/outputs/apk/debug/app-debug.apk
-```
-
-### Release APK via EAS Build (recommended for testing/sharing)
-
-Install EAS CLI if not already installed:
-
-```bash
-npm install -g eas-cli
-eas login
-```
-
-Configure EAS (first time only):
-
-```bash
-eas build:configure
-```
-
-Build a release APK (signed, installable on any Android device):
-
-```bash
-eas build --platform android --profile preview
-```
-
-The `preview` profile in `eas.json` should be:
-
-```json
-{
-  "build": {
-    "preview": {
-      "android": {
-        "buildType": "apk"
-      }
-    },
-    "production": {
-      "android": {
-        "buildType": "aab"
-      }
-    }
-  }
-}
-```
-
-The EAS dashboard provides a download link and QR code for the APK once the build
-completes (~5–10 minutes).
+| Symptom | Cause | Fix |
+|---|---|---|
+| All 4 module rows show ✗ | Expo Go or modules not registered | Run `android:prebuild && android:apk` |
+| ZenLensCapture ✓ but wiring row shows "wiring is incomplete" | Old `ScreenCaptureModule.kt` without `checkWiring()` | Rebuild APK with updated module |
+| Dialog appears but promise never resolves | `ActivityEventListener` not registered | Check `init { reactContext.addActivityEventListener(this) }` in `ScreenCaptureModule.kt` |
+| Dialog appears, user grants, JS gets `false` | Wrong result handling branch | Check `onMediaProjectionResult()` — must check `resultCode == Activity.RESULT_OK && data != null` |
+| "No activity available" error | Module called before activity starts | Ensure app is fully foregrounded before calling `requestPermission()` |
 
 ---
 
-## Verifying native modules loaded
+## Build Verification Checklist
 
-After installing the dev build or APK on a real device, open ZenLens and navigate to:
+Run `npm run android:verify-native` — it checks all of the following:
 
-**Home → Device Readiness**
+**Kotlin files:**
+- [ ] ScreenCaptureModule.kt — implements ActivityEventListener, has `addActivityEventListener`, `onMediaProjectionResult`, `resultHandled`, `checkWiring`
+- [ ] ScreenCaptureService.kt — Service + startForeground
+- [ ] OverlayModule.kt — SYSTEM_ALERT_WINDOW + WindowManager
+- [ ] MLKitOCRModule.kt — TextRecognition + recognizeText
+- [ ] ZenLensPackage.kt — ReactPackage + createNativeModules
 
-All four rows should show a green ✓:
-- MediaProjection Capture (`NativeModules.ZenLensCapture`)
-- ML Kit OCR (`NativeModules.ZenLensOCR`)
-- System Overlay (`NativeModules.ZenLensOverlay`)
-- File Export (always available in native build)
+**AndroidManifest.xml:**
+- [ ] 6 permissions present
+- [ ] ScreenCaptureService declared with foregroundServiceType="mediaProjection"
 
-If any row shows ✗, check:
-1. The `.kt` file is in the correct package directory
-2. `ZenLensPackage` is registered in `MainApplication.kt`
-3. The build was rebuilt after adding the files (`npx expo run:android` again)
+**MainApplication.kt:**
+- [ ] ZenLensPackage registered (no duplicates)
 
----
+**MainActivity.kt:**
+- [ ] ZENLENS_ACTIVITY_RESULT_PATCH sentinel present
+- [ ] onActivityResult override calls onMediaProjectionResult
+- [ ] Imports android.content.Intent and ScreenCaptureModule
 
-## Simulation Mode (Expo Go)
-
-When running in Expo Go (no native modules registered), ZenLens automatically falls back to
-**simulation mode**:
-- The home screen shows a yellow "Expo Go Demo Mode" banner
-- `requestPermission()` always returns `true` after a brief delay
-- `captureFrame()` is never called; `recognizeTextFromCrop()` in `utils/ocr.ts`
-  returns pre-written sample text that scrolls progressively across 10 pages
-- The crop box, dedupe logic, transcript auto-save, and all export actions are fully functional
-- Device Readiness screen shows all modules as ✗ (unavailable)
-
-This allows complete UI and logic testing without a physical Android device.
-
----
-
-## Known Limitations
-
-1. **Expo Go incompatibility** — MediaProjection, SYSTEM_ALERT_WINDOW, and ML Kit require
-   a custom build. Expo Go sandboxes native modules and `NativeModules.ZenLens*` will
-   always be `undefined`.
-
-2. **Android 10+ foreground service type** — `foregroundServiceType="mediaProjection"` is
-   required on API 29+. Without it, `startForeground()` throws on start.
-
-3. **Overlay permission UX** — `SYSTEM_ALERT_WINDOW` cannot be requested via the standard
-   `ActivityCompat.requestPermissions()` flow. The user must be sent to
-   `Settings.ACTION_MANAGE_OVERLAY_PERMISSION` manually. The Setup screen handles this.
-
-4. **Screen rotation** — `screenWidth`/`screenHeight` in `ScreenCaptureModule` are captured
-   at the time `startCapture()` is called. If the device rotates mid-session, the virtual
-   display dimensions may mismatch the actual screen. Stop and restart capture after rotation.
-
-5. **ML Kit first-run latency** — On first launch, ML Kit downloads the text recognition
-   model (~4 MB on-device). Bundle it via the `com.google.mlkit.vision.textrecognition`
-   plugin (see Step 4) to eliminate this delay.
-
-6. **Privacy** — MediaProjection captures the entire screen into a `VirtualDisplay`.
-   Only the requested crop region (`x, y, width, height`) is extracted and passed to OCR.
-   The full frame is never written to disk and is recycled immediately after cropping.
+**build.gradle:**
+- [ ] ML Kit text-recognition dependency
