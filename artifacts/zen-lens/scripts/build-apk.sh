@@ -92,8 +92,14 @@ step "Running expo prebuild (generates android/ with config plugin)"
 echo "  This copies Kotlin modules, patches AndroidManifest.xml,"
 echo "  and registers ZenLensPackage — all via the config plugin."
 echo ""
-npx expo prebuild --platform android --clean
-ok "Prebuild complete"
+
+# expo prebuild may modify package.json (adds peer deps, scripts).
+# Save and restore it so those changes don't bleed into the EAS upload.
+cp package.json package.json.bak
+npx expo prebuild --platform android --no-install
+cp package.json.bak package.json
+rm -f package.json.bak
+ok "Prebuild complete (package.json restored)"
 
 # ─── Step 6: Run native verification ─────────────────────────────────────
 
@@ -130,6 +136,21 @@ step "Starting EAS Build (profile: $PROFILE)"
 echo "  This uploads your project to EAS servers and builds the APK."
 echo "  It typically takes 5-10 minutes."
 echo ""
+
+# pnpm's expo shim sets NODE_PATH before calling expo/bin/cli so that the
+# binary can resolve its own dependencies inside the virtual store.
+# EAS CLI bypasses the shim and calls `node /path/expo/bin/cli` directly,
+# which fails without NODE_PATH.  Source it here from the shim.
+EXPO_NODE_PATH="$(node -e "
+const fs = require('fs');
+const shim = fs.readFileSync('node_modules/.bin/expo', 'utf8');
+const m = shim.match(/export NODE_PATH=\"([^\"]+)\"/);
+if (m) process.stdout.write(m[1]);
+" 2>/dev/null)"
+if [ -n "$EXPO_NODE_PATH" ]; then
+  export NODE_PATH="${EXPO_NODE_PATH}${NODE_PATH:+:$NODE_PATH}"
+fi
+
 eas build --platform android --profile "$PROFILE" --non-interactive
 
 # ─── Step 9: Print next steps ────────────────────────────────────────────

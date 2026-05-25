@@ -81,7 +81,7 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
     // ── ActivityEventListener (primary result path) ────────────────────────────
 
     override fun onActivityResult(
-        activity: Activity?,
+        activity: Activity,
         requestCode: Int,
         resultCode: Int,
         data: Intent?
@@ -92,7 +92,7 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    override fun onNewIntent(intent: Intent?) {}
+    override fun onNewIntent(intent: Intent) {}
 
     // ── Permission result (idempotent, called from both paths) ─────────────────
 
@@ -138,7 +138,7 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
      */
     @ReactMethod
     fun requestPermission(promise: Promise) {
-        val activity = currentActivity
+        val activity = reactContext.currentActivity
         if (activity == null) {
             val err = Arguments.createMap().apply {
                 putBoolean("granted", false)
