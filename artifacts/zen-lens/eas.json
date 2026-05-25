@@ -13,7 +13,8 @@
         "gradleCommand": ":app:assembleDebug"
       },
       "env": {
-        "APP_ENV": "development"
+        "APP_ENV": "development",
+        "NPM_CONFIG_IGNORE_SCRIPTS": "true"
       }
     },
     "preview": {
@@ -22,7 +23,8 @@
         "buildType": "apk"
       },
       "env": {
-        "APP_ENV": "preview"
+        "APP_ENV": "preview",
+        "NPM_CONFIG_IGNORE_SCRIPTS": "true"
       }
     },
     "production": {
@@ -30,7 +32,8 @@
         "buildType": "app-bundle"
       },
       "env": {
-        "APP_ENV": "production"
+        "APP_ENV": "production",
+        "NPM_CONFIG_IGNORE_SCRIPTS": "true"
       }
     }
   }

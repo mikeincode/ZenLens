@@ -14,7 +14,9 @@
     "android:apk": "bash scripts/build-apk.sh --profile preview",
     "android:apk:dev": "bash scripts/build-apk.sh --profile development",
     "android:apk:prod": "bash scripts/build-apk.sh --profile production",
-    "android:run": "npx expo run:android"
+    "android:run": "npx expo run:android",
+    "android": "expo run:android",
+    "ios": "expo run:ios"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",
