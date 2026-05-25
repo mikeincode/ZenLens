@@ -185,6 +185,15 @@ export interface CaptureServiceStatus {
   hasProjectionToken: boolean;
 }
 
+export interface NativeDebugStatus {
+  lastNativeEvent: string;
+  lastNativeError: string;
+  permissionRequestInFlight: boolean;
+  permissionGranted: boolean;
+  hasProjectionToken: boolean;
+  serviceRunning: boolean;
+}
+
 // ─── Wiring check ─────────────────────────────────────────────────────────────
 
 /**
@@ -273,6 +282,23 @@ export async function getNativeCaptureServiceStatus(): Promise<CaptureServiceSta
   if (!mod || typeof mod.getCaptureServiceStatus !== "function") return null;
   try {
     return await mod.getCaptureServiceStatus();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Returns low-level debug state from the native module.
+ * Useful after a crash or failed permission flow — all fields persist across
+ * app resumes because the module instance survives in the same process.
+ *
+ * Returns null in Expo Go or if the module is unavailable.
+ */
+export async function getNativeDebugStatus(): Promise<NativeDebugStatus | null> {
+  const mod = getNativeCaptureModule();
+  if (!mod || typeof mod.getNativeDebugStatus !== "function") return null;
+  try {
+    return await mod.getNativeDebugStatus();
   } catch {
     return null;
   }

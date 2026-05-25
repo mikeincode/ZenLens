@@ -1,0 +1,1 @@
+- [ZenLens MainActivity patch crash](zenlens-mainactivity-patch-crash.md) — removing MainActivity.kt onActivityResult patch fixed crash; ActivityEventListener alone is the correct sole result path

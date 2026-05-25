@@ -10,8 +10,12 @@
  *   1. Copy Kotlin modules from android-native/ into the Android source tree
  *   2. Patch AndroidManifest.xml (permissions + ScreenCaptureService)
  *   3. Patch MainApplication.kt (register ZenLensPackage)
- *   4. Patch MainActivity.kt (belt-and-suspenders onActivityResult forward)
- *   5. Report ML Kit dependency status
+ *   4. Report ML Kit dependency status
+ *
+ * NOTE: MainActivity.kt patching (belt-and-suspenders onActivityResult forward)
+ * has been removed. ScreenCaptureModule implements ActivityEventListener as the
+ * sole result path. The MainActivity patch caused crashes on RN 0.73+ because it
+ * accessed the deprecated reactInstanceManager property.
  *
  * All steps are idempotent — running this script multiple times will not
  * duplicate any code, imports, or declarations.
@@ -38,9 +42,6 @@ const DEST_JAVA = path.join(
 );
 const MANIFEST_PATH = path.join(ANDROID_ROOT, "app", "src", "main", "AndroidManifest.xml");
 const MAIN_APP_PATH = path.join(DEST_JAVA, "MainApplication.kt");
-const MAIN_ACTIVITY_PATH = path.join(DEST_JAVA, "MainActivity.kt");
-
-const PATCH_SENTINEL = "// ZENLENS_ACTIVITY_RESULT_PATCH";
 
 const KT_FILES = [
   "ScreenCaptureModule.kt",
@@ -57,13 +58,6 @@ function ok(msg) { console.log(`  ✓ ${msg}`); }
 function warn(msg) { console.warn(`  ⚠  ${msg}`); warnings++; }
 function fail(msg) { console.error(`  ✗ ${msg}`); errors++; }
 function section(title) { console.log(`\n── ${title}`); }
-
-/** Insert `text` before the last closing brace of a Kotlin file. */
-function insertBeforeLastBrace(src, text) {
-  const last = src.lastIndexOf("}");
-  if (last === -1) return src;
-  return src.slice(0, last) + text + "\n" + src.slice(last);
-}
 
 /** Ensure an import line exists; add after the last existing import. */
 function ensureImport(src, importLine) {
@@ -211,69 +205,7 @@ if (!fs.existsSync(MAIN_APP_PATH)) {
   }
 }
 
-// ─── Step 4: Patch MainActivity.kt ───────────────────────────────────────────
-//
-// Adds onActivityResult override that forwards MediaProjection results to
-// ScreenCaptureModule as belt-and-suspenders.  ScreenCaptureModule's
-// ActivityEventListener (primary path) makes this optional, but having
-// both makes the flow bulletproof.  onMediaProjectionResult() is idempotent.
-
-section("Patching MainActivity.kt");
-
-if (!fs.existsSync(MAIN_ACTIVITY_PATH)) {
-  warn("MainActivity.kt not found — skipping onActivityResult patch.");
-  warn("Primary path (ActivityEventListener in ScreenCaptureModule) is still sufficient.");
-} else {
-  let src = fs.readFileSync(MAIN_ACTIVITY_PATH, "utf8");
-
-  // ── Idempotency guard ─────────────────────────────────────────────────────
-  if (src.includes(PATCH_SENTINEL)) {
-    ok("MainActivity.kt already patched (sentinel present) — skipping");
-  } else {
-    // ── Sanity check ─────────────────────────────────────────────────────────
-    if (!src.includes("class MainActivity")) {
-      fail(
-        "MainActivity.kt does not contain 'class MainActivity' — format unexpected. " +
-        "Patch manually per android-native/README.md."
-      );
-    } else {
-      // ── Add imports ────────────────────────────────────────────────────────
-      src = ensureImport(src, "import android.content.Intent");
-      src = ensureImport(src, "import com.zenlens.app.ScreenCaptureModule");
-
-      // ── Duplicate guard ────────────────────────────────────────────────────
-      const existingOverrides = (src.match(/override fun onActivityResult/g) || []).length;
-      if (existingOverrides > 0) {
-        warn(
-          `MainActivity already has ${existingOverrides} onActivityResult override(s). ` +
-          "Skipping injection to avoid duplicates. Add ZenLens forwarding manually."
-        );
-      } else {
-        // ── Inject patch ───────────────────────────────────────────────────────
-        const patch = `
-    ${PATCH_SENTINEL}
-    // Belt-and-suspenders: forward MediaProjection results to ScreenCaptureModule.
-    // ScreenCaptureModule also implements ActivityEventListener (primary path).
-    // onMediaProjectionResult() has a resultHandled guard — double-invocation is safe.
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == ScreenCaptureModule.MEDIA_PROJECTION_REQUEST) {
-            reactInstanceManager
-                ?.currentReactContext
-                ?.getNativeModule(ScreenCaptureModule::class.java)
-                ?.onMediaProjectionResult(resultCode, data)
-        }
-    }
-`;
-        src = insertBeforeLastBrace(src, patch);
-        fs.writeFileSync(MAIN_ACTIVITY_PATH, src, "utf8");
-        ok("Patched MainActivity.kt with onActivityResult → ScreenCaptureModule forward");
-      }
-    }
-  }
-}
-
-// ─── Step 5: Patch android/app/build.gradle — ML Kit dependency ──────────────
+// ─── Step 4: ML Kit dependency status ────────────────────────────────────────
 
 section("ML Kit dependency");
 

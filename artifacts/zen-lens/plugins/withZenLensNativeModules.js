@@ -7,8 +7,13 @@
  *   1. Copy all Kotlin modules from android-native/ into the generated Java source tree.
  *   2. Patch AndroidManifest.xml with permissions and ScreenCaptureService declaration.
  *   3. Patch MainApplication.kt to register ZenLensPackage.
- *   4. Patch MainActivity.kt to forward onActivityResult to ScreenCaptureModule
- *      as belt-and-suspenders alongside ScreenCaptureModule's ActivityEventListener.
+ *   4. Patch android/app/build.gradle with ML Kit dependency.
+ *
+ * NOTE: MainActivity.kt patching (belt-and-suspenders onActivityResult forward) has been
+ * removed. ScreenCaptureModule implements ActivityEventListener as the sole result path.
+ * The MainActivity patch caused crashes on RN 0.73+ because it accessed the deprecated
+ * reactInstanceManager property. ActivityEventListener alone is sufficient and is confirmed
+ * green on device.
  *
  * All steps are idempotent — running prebuild multiple times will not duplicate
  * any imports, methods, or declarations.
@@ -183,90 +188,7 @@ function withRegisterZenLensPackage(config) {
   ]);
 }
 
-// ─── Step 4: Patch MainActivity.kt — forward onActivityResult ────────────────
-//
-// ScreenCaptureModule already implements ActivityEventListener (the primary path).
-// This step adds an explicit onActivityResult override in MainActivity as a
-// belt-and-suspenders measure.  ScreenCaptureModule.onMediaProjectionResult()
-// is idempotent (resultHandled guard), so being called from both paths is safe.
-//
-// Idempotency guarantees:
-//   • Checks for ZENLENS_ACTIVITY_RESULT_PATCH sentinel before patching
-//   • Will never insert duplicate imports or method bodies
-//   • Fails loudly if MainActivity format is unexpected (no class declaration)
-
-const PATCH_SENTINEL = "// ZENLENS_ACTIVITY_RESULT_PATCH";
-
-function withPatchMainActivity(config) {
-  return withDangerousMod(config, [
-    "android",
-    (cfg) => {
-      const projectRoot = cfg.modRequest.projectRoot;
-      const mainActivityPath = path.join(
-        projectRoot,
-        "android", "app", "src", "main", "java",
-        ...PACKAGE_PATH.split("/"),
-        "MainActivity.kt"
-      );
-
-      if (!fs.existsSync(mainActivityPath)) {
-        console.warn("[ZenLens] MainActivity.kt not found — skipping onActivityResult patch.");
-        return cfg;
-      }
-
-      let src = fs.readFileSync(mainActivityPath, "utf8");
-
-      // ── Idempotency guard ───────────────────────────────────────────────
-      if (src.includes(PATCH_SENTINEL)) {
-        console.log("[ZenLens] MainActivity.kt already patched (sentinel found) — skipping.");
-        return cfg;
-      }
-
-      // ── Sanity check ────────────────────────────────────────────────────
-      if (!src.includes("class MainActivity")) {
-        throw new Error(
-          "[ZenLens] FATAL: MainActivity.kt does not contain 'class MainActivity'. " +
-          "File format is unexpected. Manual patching required. " +
-          "See android-native/README.md for the required onActivityResult override."
-        );
-      }
-
-      // ── Ensure required imports ─────────────────────────────────────────
-      src = ensureImport(src, "import android.content.Intent");
-      src = ensureImport(src, "import com.zenlens.app.ScreenCaptureModule");
-
-      // ── Inject onActivityResult override ────────────────────────────────
-      //
-      // Inserted just before the closing brace of the MainActivity class.
-      // The method calls super() first (so RN's ReactActivity forwarding fires,
-      // which triggers ActivityEventListener), then also directly calls
-      // onMediaProjectionResult() as an explicit fallback.
-
-      const patch = `
-    ${PATCH_SENTINEL}
-    // Belt-and-suspenders: explicitly forward MediaProjection results to ScreenCaptureModule.
-    // ScreenCaptureModule also implements ActivityEventListener (primary path).
-    // onMediaProjectionResult() is idempotent — double-invocation is safe.
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == ScreenCaptureModule.MEDIA_PROJECTION_REQUEST) {
-            reactInstanceManager
-                ?.currentReactContext
-                ?.getNativeModule(ScreenCaptureModule::class.java)
-                ?.onMediaProjectionResult(resultCode, data)
-        }
-    }
-`;
-
-      src = insertBeforeLastBrace(src, patch);
-      fs.writeFileSync(mainActivityPath, src, "utf8");
-      console.log("[ZenLens] Patched MainActivity.kt with onActivityResult → ScreenCaptureModule forward");
-      return cfg;
-    },
-  ]);
-}
-
-// ─── Step 5: Patch android/app/build.gradle — ML Kit dependency ──────────────
+// ─── Step 4: Patch android/app/build.gradle — ML Kit dependency ──────────────
 
 const MLKIT_DEP = 'implementation "com.google.mlkit:text-recognition:16.0.1"';
 const MLKIT_COMMENT = "// ZenLens: Google ML Kit on-device text recognition";
@@ -303,13 +225,12 @@ function withMlKitDependency(config) {
   ]);
 }
 
-// ─── Compose all five steps ───────────────────────────────────────────────────
+// ─── Compose all four steps ───────────────────────────────────────────────────
 
 module.exports = function withZenLensNativeModules(config) {
   config = withCopyKotlinModules(config);
   config = withAndroidPermissionsAndService(config);
   config = withRegisterZenLensPackage(config);
-  config = withPatchMainActivity(config);
   config = withMlKitDependency(config);
   return config;
 };

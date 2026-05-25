@@ -2,9 +2,10 @@ import { Feather } from "@expo/vector-icons";
 import Constants from "expo-constants";
 import * as Haptics from "expo-haptics";
 import { router } from "expo-router";
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  AppState,
   Platform,
   Pressable,
   ScrollView,
@@ -18,6 +19,7 @@ import { useCapture } from "@/context/CaptureContext";
 import { useColors } from "@/hooks/useColors";
 import {
   captureSingleNativeFrame,
+  getNativeCaptureServiceStatus,
   requestNativeMediaProjectionPermission,
   startNativeCaptureService,
   stopNativeCaptureService,
@@ -69,6 +71,38 @@ export default function HomeScreen() {
   } = useCapture();
 
   const [nt, setNt] = useState<NativeTestState>(INIT);
+  const appStateRef = useRef(AppState.currentState);
+
+  // On app resume (returning from Android permission dialog), refresh permission + service status
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (nextState) => {
+      if (appStateRef.current !== "active" && nextState === "active") {
+        if (nt.permission === "busy") {
+          // The dialog returned — fetch current status to reflect what happened
+          getNativeCaptureServiceStatus().then((status) => {
+            if (!status) return;
+            if (status.permissionGranted) {
+              setNt((p) => ({
+                ...p,
+                permission: "ok",
+                permissionMsg: "Granted ✓ — token cached. Tap 'Start Service' next.",
+                permissionGranted: true,
+              }));
+            } else {
+              setNt((p) => ({
+                ...p,
+                permission: "err",
+                permissionMsg: "Permission not granted — check logcat for details.",
+                permissionGranted: false,
+              }));
+            }
+          });
+        }
+      }
+      appStateRef.current = nextState;
+    });
+    return () => sub.remove();
+  }, [nt.permission]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const isActive = state === "capturing" || state === "paused";
   const wordCount = transcript.trim()
@@ -100,7 +134,11 @@ export default function HomeScreen() {
       }));
       return;
     }
-    setNt((p) => ({ ...p, permission: "busy", permissionMsg: "" }));
+    setNt((p) => ({
+      ...p,
+      permission: "busy",
+      permissionMsg: "Waiting for Android permission result…",
+    }));
     const result = await requestNativeMediaProjectionPermission();
     if (!result) {
       setNt((p) => ({
@@ -122,7 +160,7 @@ export default function HomeScreen() {
       setNt((p) => ({
         ...p,
         permission: "err",
-        permissionMsg: result.reason ?? "Permission denied.",
+        permissionMsg: result.reason ?? "Permission denied or cancelled.",
         permissionGranted: false,
       }));
     }

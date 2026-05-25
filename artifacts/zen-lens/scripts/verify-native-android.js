@@ -9,12 +9,18 @@
  *   - All 5 Kotlin files present + key tokens
  *   - ScreenCaptureModule: permission + service handoff methods
  *   - ScreenCaptureModule: ActivityEventListener wiring
+ *   - ScreenCaptureModule: getNativeDebugStatus() method
  *   - ScreenCaptureService: MediaProjection lifecycle, isRunning flag, logging
  *   - AndroidManifest.xml: all permissions + service declaration
  *   - MainApplication.kt: ZenLensPackage registered
- *   - MainActivity.kt: belt-and-suspenders onActivityResult patch
+ *   - MainActivity.kt: checked as informational warning only (patch removed — see NOTE)
  *   - android/app/build.gradle: ML Kit dependency
  *   - utils/ocr.ts: all JS wrappers present
+ *
+ * NOTE: The MainActivity.kt onActivityResult patch has been removed.
+ * ScreenCaptureModule implements ActivityEventListener as the sole result path.
+ * The MainActivity patch caused crashes on RN 0.73+ due to deprecated
+ * reactInstanceManager access. MainActivity checks below are warnings, not errors.
  *
  * Usage:
  *   node scripts/verify-native-android.js
@@ -39,8 +45,6 @@ const BUILD_GRADLE_PATH = path.join(ANDROID_ROOT, "app", "build.gradle");
 const CAPTURE_MODULE_PATH = path.join(PACKAGE_DIR, "ScreenCaptureModule.kt");
 const CAPTURE_SERVICE_PATH = path.join(PACKAGE_DIR, "ScreenCaptureService.kt");
 const OCR_UTIL = path.join(ROOT, "utils", "ocr.ts");
-
-const PATCH_SENTINEL = "// ZENLENS_ACTIVITY_RESULT_PATCH";
 
 let passed = 0;
 let failed = 0;
@@ -84,6 +88,12 @@ const REQUIRED_KT = [
     "checkWiring",
     "pendingResultCode",
     "pendingResultData",
+    "getNativeDebugStatus",
+    "lastNativeEvent",
+    "lastNativeError",
+    "permissionRequestInFlight",
+    "safeResolvePermissionPromise",
+    "safeRejectPermissionPromise",
   ]},
   { file: "ScreenCaptureService.kt", label: "ScreenCaptureService", mustContain: [
     "isRunning",
@@ -137,6 +147,8 @@ if (fs.existsSync(CAPTURE_MODULE_PATH)) {
   check("checkWiring() @ReactMethod", src.includes("fun checkWiring"), null);
   check("captureSingleFrame() @ReactMethod", src.includes("fun captureSingleFrame"),
     "Add captureSingleFrame @ReactMethod that delegates to ScreenCaptureService.captureSingleFrame()");
+  check("getNativeDebugStatus() @ReactMethod", src.includes("fun getNativeDebugStatus"),
+    "Add getNativeDebugStatus() for post-crash diagnosis");
   check("captureSingleFrame delegates to ScreenCaptureService",
     src.includes("ScreenCaptureService.captureSingleFrame"),
     "ScreenCaptureService.captureSingleFrame(callback) must be called from the module");
@@ -163,6 +175,33 @@ if (fs.existsSync(CAPTURE_MODULE_PATH)) {
   check("stopCaptureService clears pendingResultData",
     src.includes("pendingResultData = null"),
     "Set pendingResultData = null in stopCaptureService()");
+  check("onActivityResult wrapped in try/catch",
+    src.includes("fun onActivityResult") && src.includes("safeRejectPermissionPromise"),
+    "onActivityResult must never throw — wrap in try/catch");
+  check("onMediaProjectionResult wrapped in try/catch",
+    src.includes("fun onMediaProjectionResult") && src.includes("} catch (e: Exception)"),
+    "onMediaProjectionResult must never throw — wrap in try/catch");
+  check("null resultData handled explicitly",
+    src.includes("data == null"),
+    "Handle null resultData with { granted:false, reason:'MediaProjection result Intent was null' }");
+  check("RESULT_CANCELED handled explicitly",
+    src.includes("RESULT_CANCELED"),
+    "Handle user cancellation with { granted:false, reason:'User cancelled' }");
+  check("safeResolvePermissionPromise helper present",
+    src.includes("fun safeResolvePermissionPromise"),
+    "Promise must be resolved exactly once via a safe helper");
+  check("safeRejectPermissionPromise helper present",
+    src.includes("fun safeRejectPermissionPromise"),
+    "Promise rejection path must be safe and wrapped");
+  check("permissionRequestInFlight flag present",
+    src.includes("permissionRequestInFlight"),
+    "Track in-flight state for UI disable + debug status");
+  check("lastNativeEvent state present",
+    src.includes("lastNativeEvent"),
+    "Track last event for post-crash diagnosis");
+  check("lastNativeError state present",
+    src.includes("lastNativeError"),
+    "Track last error for post-crash diagnosis");
 
   // Duplicate API checks
   const overrideCount = (src.match(/override fun onActivityResult/g) || []).length;
@@ -172,7 +211,7 @@ if (fs.existsSync(CAPTURE_MODULE_PATH)) {
 
 // ─── 4. ScreenCaptureModule — ActivityEventListener wiring ───────────────────
 
-section("ScreenCaptureModule — ActivityEventListener (primary result path)");
+section("ScreenCaptureModule — ActivityEventListener (sole result path)");
 if (fs.existsSync(CAPTURE_MODULE_PATH)) {
   const src = fs.readFileSync(CAPTURE_MODULE_PATH, "utf8");
   check("Implements ActivityEventListener", src.includes("ActivityEventListener"), null);
@@ -180,7 +219,7 @@ if (fs.existsSync(CAPTURE_MODULE_PATH)) {
   check("onNewIntent override (interface requirement)", src.includes("override fun onNewIntent"), null);
   check("resultHandled @Volatile dedup guard", src.includes("@Volatile") && src.includes("resultHandled"), null);
   check("onMediaProjectionResult() dedup-safe handler", src.includes("fun onMediaProjectionResult"), null);
-  check("permissionPromise?.resolve called", src.includes("permissionPromise?.resolve"), null);
+  check("safeResolvePermissionPromise called", src.includes("safeResolvePermissionPromise"), null);
 }
 
 // ─── 5. ScreenCaptureService — foreground service lifecycle ──────────────────
@@ -258,26 +297,27 @@ if (fs.existsSync(MAIN_APP_PATH)) {
     `Found ${count} references — remove duplicates`);
 } else { check("MainApplication.kt exists", false, MAIN_APP_PATH); }
 
-// ─── 8. MainActivity.kt ──────────────────────────────────────────────────────
+// ─── 8. MainActivity.kt — informational only (patch removed) ─────────────────
 
-section("Belt-and-suspenders — MainActivity.kt");
+section("MainActivity.kt — informational (onActivityResult patch removed)");
+console.log("  ℹ  The MainActivity.kt belt-and-suspenders patch has been removed.");
+console.log("  ℹ  ActivityEventListener in ScreenCaptureModule is the sole result path.");
+console.log("  ℹ  The patch caused crashes on RN 0.73+ (deprecated reactInstanceManager).");
 if (fs.existsSync(MAIN_ACTIVITY_PATH)) {
   const src = fs.readFileSync(MAIN_ACTIVITY_PATH, "utf8");
-  check("ZENLENS_ACTIVITY_RESULT_PATCH sentinel present", src.includes(PATCH_SENTINEL),
-    "Run: npm run android:sync-native");
-  check("onActivityResult override present", src.includes("override fun onActivityResult"), null);
-  check("Forwards to onMediaProjectionResult", src.includes("onMediaProjectionResult"), null);
-  check("Imports android.content.Intent", src.includes("import android.content.Intent"), null);
-  check("Imports ScreenCaptureModule", src.includes("import com.zenlens.app.ScreenCaptureModule"), null);
-  const dupCount = (src.match(/override fun onActivityResult/g) || []).length;
-  check("No duplicate onActivityResult overrides", dupCount <= 1,
-    `Found ${dupCount} — compilation will fail`);
-  const sentinelCount = (src.match(/ZENLENS_ACTIVITY_RESULT_PATCH/g) || []).length;
-  check("No duplicate patch sentinels", sentinelCount <= 1,
-    `Found ${sentinelCount} — idempotency broken`);
+  const hasPatch = src.includes("ZENLENS_ACTIVITY_RESULT_PATCH");
+  const hasOverride = src.includes("override fun onActivityResult");
+  if (hasPatch || hasOverride) {
+    warn("MainActivity.kt still contains the old patch — consider removing it manually",
+      "The patch is no longer injected but leftover code won't cause errors unless " +
+      "it conflicts with the RN version's onActivityResult signature");
+  } else {
+    console.log("  ✓ MainActivity.kt is clean — no leftover patch");
+    passed++;
+  }
 } else {
-  warn("MainActivity.kt not found — belt-and-suspenders checks skipped",
-    "Primary path (ActivityEventListener) is still sufficient");
+  console.log("  ✓ MainActivity.kt not found — no patch to worry about");
+  passed++;
 }
 
 // ─── 9. build.gradle ─────────────────────────────────────────────────────────
@@ -301,12 +341,14 @@ if (fs.existsSync(OCR_UTIL)) {
     "stopNativeCaptureService",
     "getNativeCaptureServiceStatus",
     "captureSingleNativeFrame",
+    "getNativeDebugStatus",
   ]) { check(`export ${fn}()`, src.includes(fn), `Add async function ${fn}() to utils/ocr.ts`); }
   check("ZenLensCapture referenced", src.includes("ZenLensCapture"), null);
   check("ZenLensOCR referenced", src.includes("ZenLensOCR"), null);
   check("SingleFrameResult type exported", src.includes("SingleFrameResult"), null);
   check("SingleFrameSuccess interface declared", src.includes("SingleFrameSuccess"), null);
   check("SingleFrameError interface declared", src.includes("SingleFrameError"), null);
+  check("NativeDebugStatus type exported", src.includes("NativeDebugStatus"), null);
   check("captureSingleNativeFrame returns null on missing module",
     src.includes("typeof mod.captureSingleFrame") || src.includes("captureSingleFrame"),
     "Wrapper must check that captureSingleFrame exists before calling it");
@@ -334,6 +376,8 @@ if (fs.existsSync(readinessPath)) {
     "captureSingleNativeFrame",
     "Test Single Frame Capture",
     "handleTestSingleFrame",
+    "getNativeDebugStatus",
+    "NativeDebugStatus",
   ]) { check(`readiness.tsx has '${token}'`, src.includes(token), null); }
 }
 
@@ -350,11 +394,14 @@ Native APK test order:
   1.  npm run android:apk                    → build APK
   2.  adb install <apk>                      → install on device
   3.  Open ZenLens → Device Readiness        → all 9 rows green
-  4.  Tap 'Test MediaProjection Permission'  → Android dialog appears → grant
-  5.  Tap 'Test Foreground Capture Service'  → persistent notification visible
-  6.  Tap 'Test Single Frame Capture'        → frame metadata appears (width×height)
-  7.  Tap 'Stop Capture Service'             → notification disappears, token cleared
-  8.  If all pass → next step is crop-region capture, then OCR
+  4.  Tap 'Test MediaProjection Permission'  → Android dialog appears → choose 'Share entire screen'
+  5.  Button shows "Waiting for Android permission result..." while dialog is open
+  6.  After granting: "Permission granted ✓ — token cached"
+  7.  Check Native Debug Status panel        → lastNativeEvent shows permissionGranted
+  8.  Tap 'Test Foreground Capture Service'  → persistent notification visible
+  9.  Tap 'Test Single Frame Capture'        → frame metadata appears (width×height)
+  10. Tap 'Stop Capture Service'             → notification disappears, token cleared
+  11. If all pass → next step is crop-region capture, then OCR
 `);
   process.exit(0);
 } else {
@@ -363,7 +410,7 @@ Native APK test order:
 
 Fix sequence:
   npm run android:prebuild       # regenerates android/ with config plugin
-  npm run android:sync-native    # re-sync Kotlin + patch manifests + patch MainActivity
+  npm run android:sync-native    # re-sync Kotlin + patch manifests
   npm run android:verify-native  # verify again
 `);
   process.exit(1);

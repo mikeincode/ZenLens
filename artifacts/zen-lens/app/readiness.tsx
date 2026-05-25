@@ -5,6 +5,7 @@ import { router } from "expo-router";
 import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  AppState,
   NativeModules,
   Platform,
   Pressable,
@@ -18,11 +19,13 @@ import {
   captureSingleNativeFrame,
   checkPermissionWiring,
   getNativeCaptureServiceStatus,
+  getNativeDebugStatus,
   requestNativeMediaProjectionPermission,
   startNativeCaptureService,
   stopNativeCaptureService,
   type PermissionWiringStatus,
   type CaptureServiceStatus,
+  type NativeDebugStatus,
   type SingleFrameResult,
 } from "@/utils/ocr";
 import { useColors } from "@/hooks/useColors";
@@ -91,15 +94,29 @@ export default function ReadinessScreen() {
   const [lastFrameResult, setLastFrameResult] = useState<SingleFrameResult | null>(null);
   const [permGranted, setPermGranted] = useState(false);
   const [svcRunning, setSvcRunning] = useState(false);
+  const [debugStatus, setDebugStatus] = useState<NativeDebugStatus | null>(null);
 
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const appStateRef = useRef(AppState.currentState);
 
   useEffect(() => {
     runChecks();
+    refreshDebugStatus();
     // Poll service status every 3s while screen is open
     pollingRef.current = setInterval(pollServiceStatus, 3000);
+
+    // On app resume (returning from Android permission dialog), refresh status + debug info
+    const appStateSub = AppState.addEventListener("change", (nextState) => {
+      if (appStateRef.current !== "active" && nextState === "active") {
+        pollServiceStatus();
+        refreshDebugStatus();
+      }
+      appStateRef.current = nextState;
+    });
+
     return () => {
       if (pollingRef.current) clearInterval(pollingRef.current);
+      appStateSub.remove();
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -117,6 +134,11 @@ export default function ReadinessScreen() {
         ? { status: "ok", detail: "ScreenCaptureService is running. Check Android notification bar." }
         : { status: "err", detail: "Service not running. Tap 'Test Foreground Capture Service' below." },
     }));
+  }
+
+  async function refreshDebugStatus() {
+    const status = await getNativeDebugStatus();
+    setDebugStatus(status);
   }
 
   async function runChecks() {
@@ -257,9 +279,16 @@ export default function ReadinessScreen() {
   async function handleTestPermission() {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     if (isExpoGo) { setMpMsg("Not available in Expo Go."); setMpState("err"); return; }
-    setMpState("busy"); setMpMsg("");
+    setMpState("busy");
+    setMpMsg("Waiting for Android permission result…");
     const result = await requestNativeMediaProjectionPermission();
-    if (!result) { setMpState("err"); setMpMsg("ZenLensCapture module not found."); return; }
+    if (!result) {
+      setMpState("err");
+      setMpMsg("ZenLensCapture module not found.");
+      await refreshDebugStatus();
+      return;
+    }
+    await refreshDebugStatus();
     if (result.granted) {
       setMpState("ok");
       setMpMsg("Permission granted ✓ — token cached. Start the service next.");
@@ -267,7 +296,7 @@ export default function ReadinessScreen() {
       await pollServiceStatus();
     } else {
       setMpState("err");
-      setMpMsg(result.reason ?? "Permission denied.");
+      setMpMsg(result.reason ?? "Permission denied or cancelled.");
     }
   }
 
@@ -614,6 +643,79 @@ export default function ReadinessScreen() {
           </Pressable>
         </View>
 
+        {/* ── Native Debug Status ───────────────────────────────────────────── */}
+        {!isExpoGo && (
+          <View style={styles.section}>
+            <Text style={[styles.sectionTitle, { color: colors.mutedForeground }]}>
+              Native Debug Status
+            </Text>
+            <Text style={[styles.testHint, { color: colors.mutedForeground }]}>
+              Shows the last event and error recorded inside the native module.
+              Persists across app resumes — check this after a crash or failed permission.
+            </Text>
+
+            <Pressable
+              onPress={refreshDebugStatus}
+              style={({ pressed }) => [
+                styles.refreshBtn,
+                { backgroundColor: colors.secondary, borderColor: colors.border, opacity: pressed ? 0.7 : 1, marginBottom: 4 },
+              ]}
+            >
+              <Feather name="refresh-cw" size={14} color={colors.mutedForeground} />
+              <Text style={[styles.refreshText, { color: colors.mutedForeground }]}>Refresh debug status</Text>
+            </Pressable>
+
+            <View style={[styles.debugPanel, { backgroundColor: colors.card, borderColor: colors.border }]}>
+              {debugStatus == null ? (
+                <Text style={[styles.debugRow, { color: colors.mutedForeground }]}>
+                  {(NativeModules as any).ZenLensCapture
+                    ? "Tap 'Refresh debug status' above to load."
+                    : "ZenLensCapture module not loaded — native APK required."}
+                </Text>
+              ) : (
+                <>
+                  <View style={styles.debugLine}>
+                    <Text style={[styles.debugKey, { color: colors.mutedForeground }]}>lastNativeEvent</Text>
+                    <Text style={[styles.debugVal, { color: debugStatus.lastNativeEvent === "none" ? colors.mutedForeground : colors.foreground }]} selectable>
+                      {debugStatus.lastNativeEvent || "none"}
+                    </Text>
+                  </View>
+                  <View style={styles.debugLine}>
+                    <Text style={[styles.debugKey, { color: colors.mutedForeground }]}>lastNativeError</Text>
+                    <Text style={[styles.debugVal, { color: debugStatus.lastNativeError ? colors.destructive : colors.mutedForeground }]} selectable>
+                      {debugStatus.lastNativeError || "none"}
+                    </Text>
+                  </View>
+                  <View style={styles.debugLine}>
+                    <Text style={[styles.debugKey, { color: colors.mutedForeground }]}>permissionInFlight</Text>
+                    <Text style={[styles.debugVal, { color: debugStatus.permissionRequestInFlight ? colors.warning : colors.mutedForeground }]}>
+                      {debugStatus.permissionRequestInFlight ? "true — waiting for dialog result" : "false"}
+                    </Text>
+                  </View>
+                  <View style={styles.debugLine}>
+                    <Text style={[styles.debugKey, { color: colors.mutedForeground }]}>permissionGranted</Text>
+                    <Text style={[styles.debugVal, { color: debugStatus.permissionGranted ? colors.success : colors.mutedForeground }]}>
+                      {debugStatus.permissionGranted ? "true" : "false"}
+                    </Text>
+                  </View>
+                  <View style={styles.debugLine}>
+                    <Text style={[styles.debugKey, { color: colors.mutedForeground }]}>hasProjectionToken</Text>
+                    <Text style={[styles.debugVal, { color: debugStatus.hasProjectionToken ? colors.success : colors.mutedForeground }]}>
+                      {debugStatus.hasProjectionToken ? "true" : "false"}
+                    </Text>
+                  </View>
+                  <View style={[styles.debugLine, { borderBottomWidth: 0 }]}>
+                    <Text style={[styles.debugKey, { color: colors.mutedForeground }]}>serviceRunning</Text>
+                    <Text style={[styles.debugVal, { color: debugStatus.serviceRunning ? colors.success : colors.mutedForeground }]}>
+                      {debugStatus.serviceRunning ? "true" : "false"}
+                    </Text>
+                  </View>
+                </>
+              )}
+            </View>
+          </View>
+        )}
+
         {/* Build Guide */}
         <View style={styles.section}>
           <Text style={[styles.sectionTitle, { color: colors.mutedForeground }]}>Build & Test Order</Text>
@@ -686,4 +788,9 @@ const styles = StyleSheet.create({
   codeBlock: { padding: 8, borderRadius: 6 },
   code: { fontSize: 12, fontFamily: "Inter_400Regular" },
   stepNote: { fontSize: 11, fontFamily: "Inter_400Regular", lineHeight: 16 },
+  debugPanel: { borderRadius: 12, borderWidth: 1, overflow: "hidden" },
+  debugRow: { fontSize: 12, fontFamily: "Inter_400Regular", padding: 14, lineHeight: 18 },
+  debugLine: { flexDirection: "row", alignItems: "flex-start", paddingHorizontal: 14, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: "rgba(128,128,128,0.15)", gap: 8 },
+  debugKey: { fontSize: 11, fontFamily: "Inter_500Medium", width: 150, flexShrink: 0, paddingTop: 1 },
+  debugVal: { flex: 1, fontSize: 11, fontFamily: "Inter_400Regular", lineHeight: 16 },
 });

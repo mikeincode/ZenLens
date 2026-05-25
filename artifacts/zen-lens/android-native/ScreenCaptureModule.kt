@@ -37,6 +37,11 @@ private const val TAG = "ZenLensCapture"
  *       | { success: false, reason: string }
  *
  *   requestOverlayPermission() → boolean
+ *
+ *   getNativeDebugStatus()
+ *     → { lastNativeEvent: string, lastNativeError: string,
+ *          permissionRequestInFlight: boolean, permissionGranted: boolean,
+ *          hasProjectionToken: boolean, serviceRunning: boolean }
  */
 class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext), ActivityEventListener {
@@ -54,10 +59,16 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
     private var permissionPromise: Promise? = null
 
     /**
-     * Dedup guard — prevents double-resolution when both ActivityEventListener AND
-     * the MainActivity explicit forward fire for the same result.
+     * Dedup guard — prevents double-resolution when ActivityEventListener fires.
+     * Reset to false before each new requestPermission() call.
      */
     @Volatile private var resultHandled = false
+
+    /**
+     * True while requestPermission() has been called and we are waiting for the
+     * Android permission dialog to return a result.
+     */
+    @Volatile private var permissionRequestInFlight = false
 
     /**
      * Stored grant from the last successful requestPermission().
@@ -68,17 +79,27 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
 
     private var activityListenerRegistered = false
 
+    // ── Debug state (persists across app resumes so the UI can read it) ─────────
+
+    @Volatile private var lastNativeEvent: String = "none"
+    @Volatile private var lastNativeError: String = ""
+
     // ── Init ──────────────────────────────────────────────────────────────────
 
     init {
-        reactContext.addActivityEventListener(this)
-        activityListenerRegistered = true
-        Log.d(TAG, "ScreenCaptureModule init — ActivityEventListener registered")
+        try {
+            reactContext.addActivityEventListener(this)
+            activityListenerRegistered = true
+            Log.d(TAG, "ScreenCaptureModule init — ActivityEventListener registered")
+        } catch (e: Exception) {
+            Log.e(TAG, "ScreenCaptureModule init — addActivityEventListener failed: ${e.message}")
+            lastNativeError = "init/addActivityEventListener: ${e.message}"
+        }
     }
 
     override fun getName() = MODULE_NAME
 
-    // ── ActivityEventListener (primary result path) ────────────────────────────
+    // ── ActivityEventListener (primary + only result path) ────────────────────
 
     override fun onActivityResult(
         activity: Activity,
@@ -86,47 +107,122 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
         resultCode: Int,
         data: Intent?
     ) {
-        if (requestCode == MEDIA_PROJECTION_REQUEST) {
-            Log.d(TAG, "onActivityResult: requestCode=$requestCode resultCode=$resultCode (primary path)")
-            onMediaProjectionResult(resultCode, data)
+        try {
+            if (requestCode == MEDIA_PROJECTION_REQUEST) {
+                Log.d(TAG, "onActivityResult: requestCode=$requestCode resultCode=$resultCode data=${data != null}")
+                lastNativeEvent = "onActivityResult: requestCode=$requestCode resultCode=$resultCode hasData=${data != null}"
+                onMediaProjectionResult(resultCode, data)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "onActivityResult: uncaught exception — ${e.message}", e)
+            lastNativeError = "onActivityResult: ${e.message}"
+            safeRejectPermissionPromise("onActivityResult threw: ${e.message}")
         }
     }
 
     override fun onNewIntent(intent: Intent) {}
 
-    // ── Permission result (idempotent, called from both paths) ─────────────────
+    // ── Permission result (idempotent — resolves promise exactly once) ─────────
 
     fun onMediaProjectionResult(resultCode: Int, data: Intent?) {
-        if (resultHandled) {
-            Log.d(TAG, "onMediaProjectionResult: already handled — skipping duplicate")
-            return
+        try {
+            Log.d(TAG, "onMediaProjectionResult: called — resultHandled=$resultHandled resultCode=$resultCode hasData=${data != null}")
+
+            if (resultHandled) {
+                Log.d(TAG, "onMediaProjectionResult: already handled — skipping duplicate")
+                return
+            }
+            resultHandled = true
+            permissionRequestInFlight = false
+
+            val result = Arguments.createMap()
+
+            when {
+                resultCode == Activity.RESULT_OK && data != null -> {
+                    Log.d(TAG, "onMediaProjectionResult: GRANTED — storing pendingResultCode/Data")
+                    lastNativeEvent = "permissionGranted: resultCode=$resultCode"
+                    pendingResultCode = resultCode
+                    pendingResultData = data
+                    result.putBoolean("granted", true)
+                    result.putBoolean("permissionCached", true)
+                    safeResolvePermissionPromise(result)
+                }
+                resultCode == Activity.RESULT_CANCELED -> {
+                    Log.d(TAG, "onMediaProjectionResult: CANCELED by user")
+                    lastNativeEvent = "permissionCanceled"
+                    pendingResultCode = Activity.RESULT_CANCELED
+                    pendingResultData = null
+                    result.putBoolean("granted", false)
+                    result.putBoolean("permissionCached", false)
+                    result.putString("reason", "User cancelled the MediaProjection permission dialog")
+                    safeResolvePermissionPromise(result)
+                }
+                data == null -> {
+                    Log.e(TAG, "onMediaProjectionResult: resultCode=$resultCode but resultData Intent was null")
+                    lastNativeError = "resultData Intent was null (resultCode=$resultCode)"
+                    pendingResultCode = Activity.RESULT_CANCELED
+                    pendingResultData = null
+                    result.putBoolean("granted", false)
+                    result.putBoolean("permissionCached", false)
+                    result.putString("reason", "MediaProjection result Intent was null (resultCode=$resultCode)")
+                    safeResolvePermissionPromise(result)
+                }
+                else -> {
+                    Log.e(TAG, "onMediaProjectionResult: unexpected resultCode=$resultCode, data=${data != null}")
+                    lastNativeError = "unexpected result: resultCode=$resultCode"
+                    pendingResultCode = Activity.RESULT_CANCELED
+                    pendingResultData = null
+                    result.putBoolean("granted", false)
+                    result.putBoolean("permissionCached", false)
+                    result.putString("reason", "Unexpected MediaProjection result: resultCode=$resultCode")
+                    safeResolvePermissionPromise(result)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "onMediaProjectionResult: uncaught exception — ${e.message}", e)
+            lastNativeError = "onMediaProjectionResult: ${e.message}"
+            permissionRequestInFlight = false
+            safeRejectPermissionPromise("onMediaProjectionResult threw: ${e.message}")
         }
-        resultHandled = true
+    }
 
-        // Reset guard after 500ms so a second requestPermission() call can work
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            resultHandled = false
-        }, 500)
+    // ── Promise safety helpers ─────────────────────────────────────────────────
 
-        val result = Arguments.createMap()
-
-        if (resultCode == Activity.RESULT_OK && data != null) {
-            Log.d(TAG, "onMediaProjectionResult: GRANTED — storing pendingResultCode/Data")
-            pendingResultCode = resultCode
-            pendingResultData = data
-            result.putBoolean("granted", true)
-            result.putBoolean("permissionCached", true)
-            permissionPromise?.resolve(result)
-        } else {
-            Log.d(TAG, "onMediaProjectionResult: DENIED or cancelled")
-            pendingResultCode = Activity.RESULT_CANCELED
-            pendingResultData = null
-            result.putBoolean("granted", false)
-            result.putBoolean("permissionCached", false)
-            result.putString("reason", "User denied or cancelled the MediaProjection permission dialog")
-            permissionPromise?.resolve(result)
+    /**
+     * Resolve permissionPromise exactly once. Clears permissionPromise after resolving.
+     * Never throws.
+     */
+    private fun safeResolvePermissionPromise(result: WritableMap) {
+        try {
+            val p = permissionPromise
+            permissionPromise = null
+            p?.resolve(result)
+        } catch (e: Exception) {
+            Log.e(TAG, "safeResolvePermissionPromise: resolve threw — ${e.message}", e)
+            lastNativeError = "promise.resolve threw: ${e.message}"
         }
-        permissionPromise = null
+    }
+
+    /**
+     * Reject permissionPromise exactly once as an error map (not a JS exception).
+     * Resolves with { granted:false, reason } so JS does not throw.
+     * Never throws.
+     */
+    private fun safeRejectPermissionPromise(reason: String) {
+        try {
+            val p = permissionPromise
+            permissionPromise = null
+            if (p != null) {
+                val err = Arguments.createMap().apply {
+                    putBoolean("granted", false)
+                    putBoolean("permissionCached", false)
+                    putString("reason", reason)
+                }
+                p.resolve(err)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "safeRejectPermissionPromise: threw — ${e.message}", e)
+        }
     }
 
     // ── @ReactMethod: requestPermission ───────────────────────────────────────
@@ -138,27 +234,61 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
      */
     @ReactMethod
     fun requestPermission(promise: Promise) {
-        val activity = reactContext.currentActivity
-        if (activity == null) {
+        try {
+            Log.d(TAG, "requestPermission: called")
+            lastNativeEvent = "requestPermission: called"
+
+            val activity = reactContext.currentActivity
+            if (activity == null) {
+                Log.e(TAG, "requestPermission: currentActivity is null")
+                lastNativeError = "requestPermission: currentActivity null"
+                val err = Arguments.createMap().apply {
+                    putBoolean("granted", false)
+                    putBoolean("permissionCached", false)
+                    putString("reason", "No activity available — ensure the app is fully foregrounded")
+                }
+                promise.resolve(err)
+                return
+            }
+
+            mediaProjectionManager = try {
+                activity.getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+                    as android.media.projection.MediaProjectionManager
+            } catch (e: Exception) {
+                Log.e(TAG, "requestPermission: getSystemService failed — ${e.message}")
+                lastNativeError = "getSystemService(MEDIA_PROJECTION_SERVICE): ${e.message}"
+                val err = Arguments.createMap().apply {
+                    putBoolean("granted", false)
+                    putBoolean("permissionCached", false)
+                    putString("reason", "Could not get MediaProjectionManager: ${e.message}")
+                }
+                promise.resolve(err)
+                return
+            }
+
+            // Store promise BEFORE launching intent so result handler can resolve it
+            permissionPromise = promise
+            resultHandled = false
+            permissionRequestInFlight = true
+
+            Log.d(TAG, "requestPermission: launching MediaProjection intent (request=$MEDIA_PROJECTION_REQUEST)")
+            lastNativeEvent = "requestPermission: startActivityForResult launched"
+
+            val intent = mediaProjectionManager!!.createScreenCaptureIntent()
+            activity.startActivityForResult(intent, MEDIA_PROJECTION_REQUEST)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "requestPermission: uncaught exception — ${e.message}", e)
+            lastNativeError = "requestPermission: ${e.message}"
+            permissionRequestInFlight = false
+            permissionPromise = null
             val err = Arguments.createMap().apply {
                 putBoolean("granted", false)
                 putBoolean("permissionCached", false)
-                putString("reason", "No activity available — ensure the app is fully foregrounded")
+                putString("reason", "requestPermission threw: ${e.message}")
             }
-            promise.resolve(err)
-            return
+            try { promise.resolve(err) } catch (_: Exception) {}
         }
-
-        mediaProjectionManager = activity.getSystemService(
-            Context.MEDIA_PROJECTION_SERVICE
-        ) as android.media.projection.MediaProjectionManager
-
-        permissionPromise = promise
-        resultHandled = false
-
-        Log.d(TAG, "requestPermission: launching MediaProjection intent (request=$MEDIA_PROJECTION_REQUEST)")
-        val intent = mediaProjectionManager!!.createScreenCaptureIntent()
-        activity.startActivityForResult(intent, MEDIA_PROJECTION_REQUEST)
     }
 
     // ── @ReactMethod: startCaptureService ─────────────────────────────────────
@@ -277,6 +407,47 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
             putBoolean("singleFrameWiringPresent", true)
         }
         promise.resolve(result)
+    }
+
+    // ── @ReactMethod: getNativeDebugStatus ────────────────────────────────────
+
+    /**
+     * Returns low-level debug state useful after a crash or failed permission flow.
+     * All fields are safe to read at any time — no side effects.
+     *
+     * {
+     *   lastNativeEvent:          string  — last lifecycle event logged by the module
+     *   lastNativeError:          string  — last error message (empty if no error)
+     *   permissionRequestInFlight: boolean — true if requestPermission() launched but no result yet
+     *   permissionGranted:         boolean — true if a valid MediaProjection token is stored
+     *   hasProjectionToken:        boolean — true if pendingResultData is non-null
+     *   serviceRunning:            boolean — ScreenCaptureService.isRunning
+     * }
+     */
+    @ReactMethod
+    fun getNativeDebugStatus(promise: Promise) {
+        try {
+            val result = Arguments.createMap().apply {
+                putString("lastNativeEvent", lastNativeEvent)
+                putString("lastNativeError", lastNativeError)
+                putBoolean("permissionRequestInFlight", permissionRequestInFlight)
+                putBoolean("permissionGranted", pendingResultCode == Activity.RESULT_OK && pendingResultData != null)
+                putBoolean("hasProjectionToken", pendingResultData != null)
+                putBoolean("serviceRunning", ScreenCaptureService.isRunning)
+            }
+            promise.resolve(result)
+        } catch (e: Exception) {
+            Log.e(TAG, "getNativeDebugStatus: threw — ${e.message}")
+            val err = Arguments.createMap().apply {
+                putString("lastNativeEvent", "getNativeDebugStatus threw")
+                putString("lastNativeError", e.message ?: "unknown")
+                putBoolean("permissionRequestInFlight", false)
+                putBoolean("permissionGranted", false)
+                putBoolean("hasProjectionToken", false)
+                putBoolean("serviceRunning", false)
+            }
+            promise.resolve(err)
+        }
     }
 
     // ── @ReactMethod: captureSingleFrame ──────────────────────────────────────
