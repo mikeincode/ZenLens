@@ -16,6 +16,7 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import {
+  captureNativeRegion,
   captureSingleNativeFrame,
   checkPermissionWiring,
   getNativeCaptureServiceStatus,
@@ -23,9 +24,11 @@ import {
   requestNativeMediaProjectionPermission,
   startNativeCaptureService,
   stopNativeCaptureService,
-  type PermissionWiringStatus,
   type CaptureServiceStatus,
+  type CropRect,
   type NativeDebugStatus,
+  type PermissionWiringStatus,
+  type RegionCaptureResult,
   type SingleFrameResult,
 } from "@/utils/ocr";
 import { useColors } from "@/hooks/useColors";
@@ -92,6 +95,10 @@ export default function ReadinessScreen() {
   const [frameState, setFrameState] = useState<"idle" | "busy" | "ok" | "err">("idle");
   const [frameMsg, setFrameMsg] = useState("");
   const [lastFrameResult, setLastFrameResult] = useState<SingleFrameResult | null>(null);
+  const [cropPreset, setCropPreset] = useState<"center" | "topHalf" | "bottomHalf" | "custom">("center");
+  const [cropState, setCropState] = useState<"idle" | "busy" | "ok" | "err">("idle");
+  const [cropMsg, setCropMsg] = useState("");
+  const [lastCropResult, setLastCropResult] = useState<RegionCaptureResult | null>(null);
   const [permGranted, setPermGranted] = useState(false);
   const [svcRunning, setSvcRunning] = useState(false);
   const [debugStatus, setDebugStatus] = useState<NativeDebugStatus | null>(null);
@@ -349,6 +356,44 @@ export default function ReadinessScreen() {
     } else {
       setFrameState("err");
       setFrameMsg(result.reason);
+    }
+  }
+
+  async function handleTestCropRegion() {
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setCropState("busy"); setCropMsg(""); setLastCropResult(null);
+
+    let rect: CropRect;
+    switch (cropPreset) {
+      case "center":
+        rect = { x: 200, y: 500, width: 680, height: 680 };
+        break;
+      case "topHalf":
+        rect = { x: 0, y: 0, width: 1080, height: 1170 };
+        break;
+      case "bottomHalf":
+        rect = { x: 0, y: 1170, width: 1080, height: 1170 };
+        break;
+      default:
+        rect = { x: 100, y: 100, width: 500, height: 500 };
+    }
+
+    const result = await captureNativeRegion(rect);
+    if (!result) {
+      setCropState("err");
+      setCropMsg("captureRegion() not available — rebuild APK with updated ScreenCaptureModule.kt.");
+      return;
+    }
+    setLastCropResult(result);
+    if (result.success) {
+      setCropState("ok");
+      setCropMsg(
+        `Crop ✓ — source ${result.sourceWidth}×${result.sourceHeight} · ` +
+        `crop (${result.cropX},${result.cropY}) ${result.cropWidth}×${result.cropHeight}`
+      );
+    } else {
+      setCropState("err");
+      setCropMsg(result.reason);
     }
   }
 
@@ -620,6 +665,71 @@ export default function ReadinessScreen() {
             </View>
           </Pressable>
 
+          {/* ── Crop Region Capture ──────────────────────────────────────── */}
+          <View style={{ gap: 8 }}>
+            {/* Preset selector */}
+            <Text style={[styles.testBtnSub, { color: colors.mutedForeground, paddingHorizontal: 2, marginTop: 4 }]}>
+              Crop preset (pixel coords for a 1080p screen — native side clamps to actual size):
+            </Text>
+            <View style={{ flexDirection: "row", gap: 6 }}>
+              {(["center", "topHalf", "bottomHalf", "custom"] as const).map((p) => (
+                <Pressable
+                  key={p}
+                  onPress={() => { setCropPreset(p); setCropState("idle"); setCropMsg(""); setLastCropResult(null); }}
+                  style={({ pressed }) => ({
+                    flex: 1,
+                    paddingVertical: 7,
+                    paddingHorizontal: 4,
+                    borderRadius: 8,
+                    borderWidth: 1,
+                    alignItems: "center",
+                    backgroundColor: cropPreset === p ? `${colors.primary}18` : colors.card,
+                    borderColor: cropPreset === p ? `${colors.primary}66` : colors.border,
+                    opacity: pressed ? 0.7 : 1,
+                  })}
+                >
+                  <Text style={{
+                    fontSize: 10,
+                    fontFamily: "Inter_500Medium",
+                    color: cropPreset === p ? colors.primary : colors.mutedForeground,
+                    textAlign: "center",
+                  }}>
+                    {p === "center" ? "Center" : p === "topHalf" ? "Top Half" : p === "bottomHalf" ? "Bot Half" : "Custom"}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+
+            {/* Test button */}
+            <Pressable
+              onPress={handleTestCropRegion}
+              disabled={cropState === "busy" || ((!permGranted || !svcRunning) && !isExpoGo)}
+              style={({ pressed }) => [
+                styles.testBtn,
+                {
+                  backgroundColor: cropState === "ok" ? `${colors.success}14` : cropState === "err" ? `${colors.destructive}14` : `${colors.primary}14`,
+                  borderColor: cropState === "ok" ? `${colors.success}44` : cropState === "err" ? `${colors.destructive}44` : `${colors.primary}44`,
+                  opacity: cropState === "busy" || ((!permGranted || !svcRunning) && !isExpoGo) || pressed ? 0.45 : 1,
+                },
+              ]}
+            >
+              {cropState === "busy" ? <ActivityIndicator size="small" color={colors.primary} /> : <Feather name="crop" size={15} color={btnColor(cropState)} />}
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.testBtnLabel, { color: btnColor(cropState) }]}>Test Crop Region Capture</Text>
+                <Text style={[styles.testBtnSub, { color: cropMsg ? btnColor(cropState) : colors.mutedForeground }]}>
+                  {cropMsg || (svcRunning
+                    ? `Captures one frame, extracts ${cropPreset} crop — metadata only`
+                    : "Grant permission and start service first")}
+                </Text>
+                {lastCropResult?.success && (
+                  <Text style={[styles.testBtnSub, { color: colors.success, marginTop: 2 }]}>
+                    {`source ${lastCropResult.sourceWidth}×${lastCropResult.sourceHeight} · crop (${lastCropResult.cropX},${lastCropResult.cropY}) ${lastCropResult.cropWidth}×${lastCropResult.cropHeight}`}
+                  </Text>
+                )}
+              </View>
+            </Pressable>
+          </View>
+
           {/* Stop service */}
           <Pressable
             onPress={handleStopService}
@@ -727,8 +837,10 @@ export default function ReadinessScreen() {
               { n: "4", label: "Confirm ZenLensCapture module row shows ✓" },
               { n: "5", label: "Tap Test MediaProjection Permission", note: "Android dialog appears — tap 'Start now'" },
               { n: "6", label: "Tap Test Foreground Capture Service", note: "Persistent notification appears in status bar" },
-              { n: "7", label: "Tap Stop Capture Service", note: "Notification disappears — token cleared" },
-              { n: "8", label: "If all pass: next step is single-frame capture", note: "Do not add OCR yet" },
+              { n: "7", label: "Tap Test Single Frame Capture", note: "Frame metadata appears — 1080×2340 or similar" },
+              { n: "8", label: "Select a crop preset, tap Test Crop Region Capture", note: "Source dims + clamped crop rect appear below the button" },
+              { n: "9", label: "Tap Stop Capture Service", note: "Notification disappears — token cleared" },
+              { n: "10", label: "If all pass: next step is OCR (ML Kit) on the crop pipeline", note: "Do not add OCR yet" },
             ].map(({ n, label, code, note }) => (
               <View key={n} style={styles.buildStep}>
                 <View style={[styles.stepNum, { backgroundColor: `${colors.primary}18` }]}>

@@ -266,7 +266,26 @@ What this proves:
 - Image.close(), ImageReader.close(), VirtualDisplay.release() all completed safely
 - No continuous loop started — exactly one frame captured
 
-**Step 7 — Tap "Stop Capture Service"**
+**Step 7 — Select a crop preset and tap "Test Crop Region Capture"**
+
+Button is enabled while permission is granted and service is running.
+Select one of: **Center**, **Top Half**, **Bottom Half**, or **Custom** using the preset buttons
+above the test button.
+
+Expected result:
+- Button turns green — "Crop ✓ — source 1080×2340 · crop (200,500) 680×680" (example)
+- `sourceWidth × sourceHeight` are your real screen dimensions
+- `cropX, cropY, cropWidth, cropHeight` show the clamped rectangle actually used
+- No pixel data crosses the JS bridge — metadata only
+
+What this proves:
+- `captureRegion()` @ReactMethod is wired and reachable from JS
+- `doCaptureRegion()` captures a full frame then clamps the rect to source bounds
+- Input validation (negative x/y, zero width/height) is enforced before allocating resources
+- Crop coordinates outside the frame are clamped gracefully — not rejected as error
+- `Image.close()`, `ImageReader.close()`, `VirtualDisplay.release()`, `HandlerThread.quitSafely()` all called via `releaseAll()`
+
+**Step 8 — Tap "Stop Capture Service"**
 
 Expected result:
 - Button turns green — "Service stopped ✓ — token cleared."
@@ -274,9 +293,9 @@ Expected result:
 - Row "Foreground Capture Service Running" goes back to ✗
 - Row "MediaProjection Permission Granted" goes back to ✗ (token consumed, Android 14+)
 
-**Step 8 — Checkpoint passed**
+**Step 9 — Checkpoint passed**
 
-If all four buttons show green in order, the single-frame capture checkpoint is **fully proven**:
+If all buttons show green in order, the crop-region capture checkpoint is **fully proven**:
 
 ```
 ✓ Permission dialog appeared and was granted
@@ -287,12 +306,13 @@ If all four buttons show green in order, the single-frame capture checkpoint is 
 ✓ VirtualDisplay created — screen content rendered to ImageReader surface
 ✓ ImageReader delivered exactly one frame within 3 seconds
 ✓ Frame metadata extracted: width, height, pixelFormat, timestamp
+✓ Crop rect clamped to source frame bounds — metadata returned to JS
 ✓ Image, ImageReader, VirtualDisplay, HandlerThread all released safely
 ✓ Service stopped cleanly — notification gone, token cleared
 ✓ Device Readiness rows report accurate live status
 ```
 
-Next build step: **crop-region frame capture**, then OCR.
+Next build step: **OCR (ML Kit)** on the crop pipeline.
 
 ---
 

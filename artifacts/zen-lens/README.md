@@ -98,10 +98,14 @@ After installing on a **physical Android device**:
    — Waits up to 3 seconds for one frame via VirtualDisplay + ImageReader
    — Status shows e.g. "Frame captured ✓ — 1080×2340" (your device resolution)
    — Frame pipeline is proven — no OCR yet, metadata only
-10. Tap **Stop Capture Service**
+10. Select a **crop preset** (Center / Top Half / Bottom Half / Custom), then tap **Test Crop Region Capture**
+    — Native side captures a full frame, clamps the requested rect, returns crop metadata
+    — Status shows e.g. "source 1080×2340 · crop (200,500) 680×680"
+    — Crop pipeline is proven — no pixel data transferred, no OCR yet
+11. Tap **Stop Capture Service**
     — Notification disappears → token cleared → "Service stopped ✓"
-11. If all four buttons show green: **the single-frame capture checkpoint is proven**
-12. Next build step: **crop-region capture**, then OCR
+12. If all buttons show green: **the crop-region capture checkpoint is proven**
+13. Next build step: **OCR (ML Kit)** on the crop pipeline
 
 > **Android 14+ note:** The MediaProjection token is one-session-use.
 > After stop, a fresh **Test MediaProjection Permission** is required before

@@ -2,20 +2,24 @@
 /**
  * scripts/verify-native-android.js
  *
- * Verifies the full foreground service handoff path for ZenLens native Android.
+ * Verifies the full foreground service handoff + crop-region capture path for
+ * ZenLens native Android.
  *
  * Checks:
  *   - android/ project structure
  *   - All 5 Kotlin files present + key tokens
  *   - ScreenCaptureModule: permission + service handoff methods
+ *   - ScreenCaptureModule: captureRegion() @ReactMethod + regionCaptureWiringPresent
  *   - ScreenCaptureModule: ActivityEventListener wiring
  *   - ScreenCaptureModule: getNativeDebugStatus() method
  *   - ScreenCaptureService: MediaProjection lifecycle, isRunning flag, logging
+ *   - ScreenCaptureService: RegionCaptureCallback + doCaptureRegion + crop clamping
  *   - AndroidManifest.xml: all permissions + service declaration
  *   - MainApplication.kt: ZenLensPackage registered
  *   - MainActivity.kt: checked as informational warning only (patch removed — see NOTE)
  *   - android/app/build.gradle: ML Kit dependency
- *   - utils/ocr.ts: all JS wrappers present
+ *   - utils/ocr.ts: all JS wrappers present (incl. captureNativeRegion + region types)
+ *   - app/readiness.tsx: Crop Test UI section present
  *
  * NOTE: The MainActivity.kt onActivityResult patch has been removed.
  * ScreenCaptureModule implements ActivityEventListener as the sole result path.
@@ -59,7 +63,7 @@ function warn(label, detail) {
 }
 function section(title) { console.log(`\n── ${title}`); }
 
-console.log("ZenLens Native Android Verification — Foreground Service Handoff");
+console.log("ZenLens Native Android Verification — Foreground Service Handoff + Crop Capture");
 console.log("=".repeat(68));
 
 // ─── 1. Project structure ─────────────────────────────────────────────────────
@@ -94,6 +98,9 @@ const REQUIRED_KT = [
     "permissionRequestInFlight",
     "safeResolvePermissionPromise",
     "safeRejectPermissionPromise",
+    "fun captureRegion",
+    "regionCaptureWiringPresent",
+    "ScreenCaptureService.captureRegion",
   ]},
   { file: "ScreenCaptureService.kt", label: "ScreenCaptureService", mustContain: [
     "isRunning",
@@ -114,6 +121,11 @@ const REQUIRED_KT = [
     "VirtualDisplay.release",
     "imageReader?.close",
     "CountDownLatch",
+    "RegionCaptureCallback",
+    "fun captureRegion",
+    "fun doCaptureRegion",
+    "coerceIn",
+    "coerceAtMost",
   ]},
   { file: "OverlayModule.kt", label: "OverlayModule", mustContain: ["SYSTEM_ALERT_WINDOW", "WindowManager"] },
   { file: "MLKitOCRModule.kt", label: "MLKitOCRModule", mustContain: ["TextRecognition", "recognizeText"] },
@@ -342,6 +354,7 @@ if (fs.existsSync(OCR_UTIL)) {
     "getNativeCaptureServiceStatus",
     "captureSingleNativeFrame",
     "getNativeDebugStatus",
+    "captureNativeRegion",
   ]) { check(`export ${fn}()`, src.includes(fn), `Add async function ${fn}() to utils/ocr.ts`); }
   check("ZenLensCapture referenced", src.includes("ZenLensCapture"), null);
   check("ZenLensOCR referenced", src.includes("ZenLensOCR"), null);
@@ -352,6 +365,17 @@ if (fs.existsSync(OCR_UTIL)) {
   check("captureSingleNativeFrame returns null on missing module",
     src.includes("typeof mod.captureSingleFrame") || src.includes("captureSingleFrame"),
     "Wrapper must check that captureSingleFrame exists before calling it");
+  check("CropRect interface declared", src.includes("CropRect"),
+    "Add: export interface CropRect { x, y, width, height }");
+  check("RegionCaptureSuccess interface declared", src.includes("RegionCaptureSuccess"),
+    "Add RegionCaptureSuccess interface with sourceWidth/Height, cropX/Y/Width/Height, pixelFormat, timestamp");
+  check("RegionCaptureError interface declared", src.includes("RegionCaptureError"),
+    "Add: export interface RegionCaptureError { success: false; reason: string }");
+  check("RegionCaptureResult type exported", src.includes("RegionCaptureResult"),
+    "Add: export type RegionCaptureResult = RegionCaptureSuccess | RegionCaptureError");
+  check("captureNativeRegion checks mod.captureRegion exists",
+    src.includes("typeof mod.captureRegion") || src.includes("mod.captureRegion"),
+    "captureNativeRegion must guard on typeof mod.captureRegion !== 'function'");
 }
 
 // ─── 11. Device Readiness screen ─────────────────────────────────────────────
@@ -378,6 +402,11 @@ if (fs.existsSync(readinessPath)) {
     "handleTestSingleFrame",
     "getNativeDebugStatus",
     "NativeDebugStatus",
+    "captureNativeRegion",
+    "Test Crop Region Capture",
+    "handleTestCropRegion",
+    "cropPreset",
+    "RegionCaptureResult",
   ]) { check(`readiness.tsx has '${token}'`, src.includes(token), null); }
 }
 
@@ -388,7 +417,7 @@ console.log(`Passed: ${passed}   Failed: ${failed}   Warnings: ${warnings}`);
 
 if (failed === 0) {
   console.log(`
-✓ All checks passed. Single-frame capture checkpoint fully wired.
+✓ All checks passed. Crop-region capture checkpoint fully wired.
 
 Native APK test order:
   1.  npm run android:apk                    → build APK
@@ -400,8 +429,10 @@ Native APK test order:
   7.  Check Native Debug Status panel        → lastNativeEvent shows permissionGranted
   8.  Tap 'Test Foreground Capture Service'  → persistent notification visible
   9.  Tap 'Test Single Frame Capture'        → frame metadata appears (width×height)
-  10. Tap 'Stop Capture Service'             → notification disappears, token cleared
-  11. If all pass → next step is crop-region capture, then OCR
+  10. Select a crop preset (Center / Top Half / Bottom Half / Custom)
+  11. Tap 'Test Crop Region Capture'         → source dims + clamped crop rect appear
+  12. Tap 'Stop Capture Service'             → notification disappears, token cleared
+  13. If all pass → next step is adding OCR (ML Kit) to the crop pipeline
 `);
   process.exit(0);
 } else {

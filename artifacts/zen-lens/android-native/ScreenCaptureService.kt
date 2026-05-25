@@ -70,6 +70,27 @@ class ScreenCaptureService : Service() {
         fun onError(reason: String)
     }
 
+    // ── RegionCaptureCallback ─────────────────────────────────────────────────
+
+    /**
+     * Callback delivered by captureRegion().
+     * Called exactly once — either onSuccess or onError.
+     *
+     * onSuccess fields:
+     *   sourceWidth/Height — actual pixel dimensions of the captured full frame
+     *   cropX/Y/Width/Height — clamped rectangle that was extracted from the frame
+     *   pixelFormat — Android PixelFormat constant (1 = RGBA_8888)
+     *   timestamp   — nanosecond timestamp of the captured frame
+     */
+    interface RegionCaptureCallback {
+        fun onSuccess(
+            sourceWidth: Int, sourceHeight: Int,
+            cropX: Int, cropY: Int, cropWidth: Int, cropHeight: Int,
+            pixelFormat: Int, timestamp: Long
+        )
+        fun onError(reason: String)
+    }
+
     // ── Companion object ─────────────────────────────────────────────────────
 
     companion object {
@@ -110,6 +131,29 @@ class ScreenCaptureService : Service() {
                 return
             }
             svc.doCaptureSingleFrame(callback)
+        }
+
+        /**
+         * Capture exactly one screen frame and extract a rectangular region.
+         *
+         * x, y must be >= 0.
+         * width, height must be > 0.
+         * Crop is clamped to source frame bounds — no rejection for partial overlap.
+         *
+         * Resource guarantees same as captureSingleFrame():
+         *   Image.close(), ImageReader.close(), VirtualDisplay.release(),
+         *   HandlerThread.quitSafely() — all always called.
+         *
+         * Timeout: 3 seconds.
+         * Returns metadata only — no pixel data transferred over the bridge.
+         */
+        fun captureRegion(x: Int, y: Int, width: Int, height: Int, callback: RegionCaptureCallback) {
+            val svc = instance
+            if (svc == null || !isRunning) {
+                callback.onError("Capture service is not running")
+                return
+            }
+            svc.doCaptureRegion(x, y, width, height, callback)
         }
     }
 
@@ -400,6 +444,184 @@ class ScreenCaptureService : Service() {
             Log.e(TAG, "doCaptureSingleFrame: exception — ${e.message}")
             releaseAll()
             callback.onError(e.message ?: "Unknown error during frame capture")
+        }
+    }
+
+    // ── doCaptureRegion ───────────────────────────────────────────────────────
+
+    /**
+     * Capture exactly one screen frame and return metadata for a cropped rectangle.
+     *
+     * Same HandlerThread + CountDownLatch + releaseAll() idiom as doCaptureSingleFrame().
+     * No pixel data is transferred over the JS bridge — metadata only.
+     *
+     * Crop clamp rules:
+     *   • x, y clamped to [0, sourceWidth/Height - 1]
+     *   • width clamped to (sourceWidth - clampedX), height clamped to (sourceHeight - clampedY)
+     *   • If the clamped rect has zero area, onError is called instead of onSuccess
+     *
+     * Resource cleanup: Image.close(), ImageReader.close(), VirtualDisplay.release(),
+     * HandlerThread.quitSafely() all called from releaseAll() before returning.
+     */
+    private fun doCaptureRegion(
+        x: Int,
+        y: Int,
+        cropW: Int,
+        cropH: Int,
+        callback: RegionCaptureCallback
+    ) {
+        val mp = mediaProjection
+        if (mp == null) {
+            Log.e(TAG, "doCaptureRegion: mediaProjection is null")
+            callback.onError("MediaProjection not available — service may be stopping")
+            return
+        }
+
+        // ── Validate raw inputs before allocating resources ───────────────────
+        if (cropW <= 0 || cropH <= 0) {
+            callback.onError("Invalid crop dimensions: width=$cropW height=$cropH — both must be > 0")
+            return
+        }
+        if (x < 0 || y < 0) {
+            callback.onError("Invalid crop origin: x=$x y=$y — must be >= 0")
+            return
+        }
+
+        // ── Get screen dimensions ─────────────────────────────────────────────
+        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        val screenW: Int
+        val screenH: Int
+        val density: Int
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = wm.currentWindowMetrics.bounds
+            screenW = bounds.width()
+            screenH = bounds.height()
+            density = resources.configuration.densityDpi
+        } else {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getMetrics(metrics)
+            screenW = metrics.widthPixels
+            screenH = metrics.heightPixels
+            density = metrics.densityDpi
+        }
+
+        Log.d(TAG, "doCaptureRegion: screen ${screenW}x${screenH} density=$density crop=($x,$y) ${cropW}x${cropH}")
+
+        var imageReader: ImageReader? = null
+        var virtualDisplay: VirtualDisplay? = null
+        var handlerThread: HandlerThread? = null
+
+        fun releaseAll() {
+            try { virtualDisplay?.release() } catch (e: Exception) {
+                Log.w(TAG, "doCaptureRegion releaseAll: VirtualDisplay.release() error: ${e.message}")
+            }
+            try { imageReader?.close() } catch (e: Exception) {
+                Log.w(TAG, "doCaptureRegion releaseAll: ImageReader.close() error: ${e.message}")
+            }
+            try { handlerThread?.quitSafely() } catch (e: Exception) {
+                Log.w(TAG, "doCaptureRegion releaseAll: HandlerThread.quitSafely() error: ${e.message}")
+            }
+            virtualDisplay = null
+            imageReader = null
+            handlerThread = null
+        }
+
+        try {
+            handlerThread = HandlerThread("ZenLensRegionCapture")
+            handlerThread!!.start()
+            val handler = Handler(handlerThread!!.looper)
+
+            val latch = CountDownLatch(1)
+            var capturedWidth = 0
+            var capturedHeight = 0
+            var capturedFormat = 0
+            var capturedTimestamp = 0L
+            var captureError: String? = null
+
+            imageReader = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 2)
+
+            imageReader!!.setOnImageAvailableListener({ reader ->
+                if (latch.count > 0L) {
+                    var img: Image? = null
+                    try {
+                        img = reader.acquireLatestImage()
+                        if (img != null) {
+                            capturedWidth = img.width
+                            capturedHeight = img.height
+                            capturedFormat = img.format
+                            capturedTimestamp = img.timestamp
+                            Log.d(TAG, "doCaptureRegion: frame received ${capturedWidth}x${capturedHeight}")
+                        } else {
+                            captureError = "acquireLatestImage() returned null"
+                            Log.w(TAG, "doCaptureRegion: acquireLatestImage() returned null")
+                        }
+                    } catch (e: Exception) {
+                        captureError = "Error acquiring image: ${e.message}"
+                        Log.e(TAG, "doCaptureRegion: image acquire error: ${e.message}")
+                    } finally {
+                        try { img?.close() } catch (e: Exception) {
+                            Log.w(TAG, "doCaptureRegion: Image.close() error: ${e.message}")
+                        }
+                        latch.countDown()
+                    }
+                }
+            }, handler)
+
+            virtualDisplay = mp.createVirtualDisplay(
+                "ZenLensRegionCapture",
+                screenW, screenH, density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                imageReader!!.surface,
+                null, null
+            )
+            Log.d(TAG, "doCaptureRegion: VirtualDisplay created, waiting for frame...")
+
+            val gotFrame = latch.await(3, TimeUnit.SECONDS)
+            releaseAll()
+
+            when {
+                !gotFrame -> {
+                    Log.w(TAG, "doCaptureRegion: timed out waiting for frame")
+                    callback.onError("Timed out waiting for frame during region capture")
+                }
+                captureError != null -> {
+                    Log.e(TAG, "doCaptureRegion: capture error — $captureError")
+                    callback.onError(captureError!!)
+                }
+                capturedWidth == 0 || capturedHeight == 0 -> {
+                    Log.e(TAG, "doCaptureRegion: zero-size frame")
+                    callback.onError("Frame had zero dimensions — unexpected error")
+                }
+                else -> {
+                    // ── Clamp crop rect to actual frame bounds ────────────────
+                    val clampedX = x.coerceIn(0, capturedWidth - 1)
+                    val clampedY = y.coerceIn(0, capturedHeight - 1)
+                    val clampedW = cropW.coerceAtMost(capturedWidth - clampedX)
+                    val clampedH = cropH.coerceAtMost(capturedHeight - clampedY)
+
+                    if (clampedW <= 0 || clampedH <= 0) {
+                        val msg = "Crop rectangle is entirely outside the source frame: " +
+                            "source=${capturedWidth}x${capturedHeight} " +
+                            "requested=($x,$y) ${cropW}x${cropH}"
+                        Log.e(TAG, "doCaptureRegion: $msg")
+                        callback.onError(msg)
+                    } else {
+                        Log.d(TAG, "doCaptureRegion: success — source=${capturedWidth}x${capturedHeight} crop=($clampedX,$clampedY) ${clampedW}x${clampedH}")
+                        callback.onSuccess(
+                            capturedWidth, capturedHeight,
+                            clampedX, clampedY, clampedW, clampedH,
+                            capturedFormat, capturedTimestamp
+                        )
+                    }
+                }
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "doCaptureRegion: exception — ${e.message}")
+            releaseAll()
+            callback.onError(e.message ?: "Unknown error during region capture")
         }
     }
 

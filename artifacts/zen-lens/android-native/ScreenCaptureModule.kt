@@ -29,10 +29,16 @@ private const val TAG = "ZenLensCapture"
  *   checkWiring()
  *     → { activityListenerRegistered: boolean, requestCode: number,
  *          permissionGranted: boolean, serviceMethodsPresent: boolean,
- *          singleFrameWiringPresent: boolean }
+ *          singleFrameWiringPresent: boolean, regionCaptureWiringPresent: boolean }
  *
  *   captureSingleFrame()
  *     → { success: true, width: number, height: number,
+ *          pixelFormat: number, timestamp: number }
+ *       | { success: false, reason: string }
+ *
+ *   captureRegion(x: number, y: number, width: number, height: number)
+ *     → { success: true, sourceWidth: number, sourceHeight: number,
+ *          cropX: number, cropY: number, cropWidth: number, cropHeight: number,
  *          pixelFormat: number, timestamp: number }
  *       | { success: false, reason: string }
  *
@@ -405,6 +411,7 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
             putBoolean("permissionGranted", pendingResultCode == Activity.RESULT_OK && pendingResultData != null)
             putBoolean("serviceMethodsPresent", true)
             putBoolean("singleFrameWiringPresent", true)
+            putBoolean("regionCaptureWiringPresent", true)
         }
         promise.resolve(result)
     }
@@ -508,6 +515,83 @@ class ScreenCaptureModule(private val reactContext: ReactApplicationContext) :
 
             override fun onError(reason: String) {
                 Log.e(TAG, "captureSingleFrame: error — $reason")
+                val err = Arguments.createMap().apply {
+                    putBoolean("success", false)
+                    putString("reason", reason)
+                }
+                promise.resolve(err)
+            }
+        })
+    }
+
+    // ── @ReactMethod: captureRegion ───────────────────────────────────────────
+
+    /**
+     * Capture exactly one screen frame and return metadata for a cropped rectangle.
+     *
+     * Requires the same preconditions as captureSingleFrame():
+     *   - ScreenCaptureService running (isRunning = true)
+     *   - MediaProjection permission granted
+     *
+     * Parameters (all integers, all passed by value over the RN bridge):
+     *   x, y      — top-left corner of the crop rect (must be >= 0)
+     *   width     — crop width  (must be > 0; clamped to sourceWidth  - x)
+     *   height    — crop height (must be > 0; clamped to sourceHeight - y)
+     *
+     * Returns on success:
+     *   { success: true, sourceWidth, sourceHeight,
+     *     cropX, cropY, cropWidth, cropHeight, pixelFormat, timestamp }
+     *
+     * Returns on failure:
+     *   { success: false, reason: string }
+     *
+     * Does NOT transfer pixel data over the bridge.
+     */
+    @ReactMethod
+    fun captureRegion(x: Int, y: Int, width: Int, height: Int, promise: Promise) {
+        if (!ScreenCaptureService.isRunning) {
+            val err = Arguments.createMap().apply {
+                putBoolean("success", false)
+                putString("reason", "Capture service is not running — start it first")
+            }
+            promise.resolve(err)
+            return
+        }
+
+        if (pendingResultCode != Activity.RESULT_OK || pendingResultData == null) {
+            val err = Arguments.createMap().apply {
+                putBoolean("success", false)
+                putString("reason", "MediaProjection permission not granted")
+            }
+            promise.resolve(err)
+            return
+        }
+
+        Log.d(TAG, "captureRegion: delegating to ScreenCaptureService x=$x y=$y w=$width h=$height")
+
+        ScreenCaptureService.captureRegion(x, y, width, height, object : ScreenCaptureService.RegionCaptureCallback {
+            override fun onSuccess(
+                sourceWidth: Int, sourceHeight: Int,
+                cropX: Int, cropY: Int, cropWidth: Int, cropHeight: Int,
+                pixelFormat: Int, timestamp: Long
+            ) {
+                Log.d(TAG, "captureRegion: success source=${sourceWidth}x${sourceHeight} crop=($cropX,$cropY) ${cropWidth}x${cropHeight}")
+                val result = Arguments.createMap().apply {
+                    putBoolean("success", true)
+                    putInt("sourceWidth", sourceWidth)
+                    putInt("sourceHeight", sourceHeight)
+                    putInt("cropX", cropX)
+                    putInt("cropY", cropY)
+                    putInt("cropWidth", cropWidth)
+                    putInt("cropHeight", cropHeight)
+                    putInt("pixelFormat", pixelFormat)
+                    putDouble("timestamp", timestamp.toDouble())
+                }
+                promise.resolve(result)
+            }
+
+            override fun onError(reason: String) {
+                Log.e(TAG, "captureRegion: error — $reason")
                 val err = Arguments.createMap().apply {
                     putBoolean("success", false)
                     putString("reason", reason)

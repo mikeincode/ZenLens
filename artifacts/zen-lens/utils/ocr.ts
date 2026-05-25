@@ -164,6 +164,41 @@ export interface SingleFrameError {
 
 export type SingleFrameResult = SingleFrameSuccess | SingleFrameError;
 
+// ─── Region / Crop capture types ──────────────────────────────────────────────
+
+/** The pixel rectangle passed to captureNativeRegion(). */
+export interface CropRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Returned when captureRegion() succeeds.
+ * All dimensions are in physical pixels.
+ * cropX/Y/Width/Height are the clamped values actually used by the native side
+ * (they may differ from the requested rect if it was partially out-of-bounds).
+ */
+export interface RegionCaptureSuccess {
+  success: true;
+  sourceWidth: number;
+  sourceHeight: number;
+  cropX: number;
+  cropY: number;
+  cropWidth: number;
+  cropHeight: number;
+  pixelFormat: number;
+  timestamp: number;
+}
+
+export interface RegionCaptureError {
+  success: false;
+  reason: string;
+}
+
+export type RegionCaptureResult = RegionCaptureSuccess | RegionCaptureError;
+
 export interface PermissionResult {
   granted: boolean;
   permissionCached: boolean;
@@ -326,6 +361,30 @@ export async function captureSingleNativeFrame(): Promise<SingleFrameResult | nu
     return await mod.captureSingleFrame();
   } catch (e: any) {
     return { success: false, reason: e?.message ?? "Unknown error during frame capture" };
+  }
+}
+
+// ─── Region / Crop capture ────────────────────────────────────────────────────
+
+/**
+ * Capture one screen frame and extract the supplied rectangular region.
+ *
+ * Returns null when running in Expo Go or when the native module is missing.
+ * Returns RegionCaptureError when the module is present but the call fails
+ * (service not running, invalid rect, timeout, etc.).
+ *
+ * The native side clamps the rect to the actual frame bounds — you will see
+ * the effective crop in RegionCaptureSuccess.cropX/Y/Width/Height.
+ *
+ * Prerequisites: service must be running and permission must be granted.
+ */
+export async function captureNativeRegion(rect: CropRect): Promise<RegionCaptureResult | null> {
+  const mod = getNativeCaptureModule();
+  if (!mod || typeof mod.captureRegion !== "function") return null;
+  try {
+    return await mod.captureRegion(rect.x, rect.y, rect.width, rect.height);
+  } catch (e: any) {
+    return { success: false, reason: e?.message ?? "Unknown error during region capture" };
   }
 }
 
